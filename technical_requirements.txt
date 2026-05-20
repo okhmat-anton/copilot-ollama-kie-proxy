@@ -1,0 +1,148 @@
+================================================================================
+TECHNICAL REQUIREMENTS: Ollama-KIE.AI Proxy Service
+================================================================================
+
+PROJECT OVERVIEW
+================================================================================
+A lightweight Python proxy service that emulates the Ollama API to transparently
+proxy requests to the KIE.AI API backend. This enables seamless integration of
+KIE.AIs language model capabilities with existing Ollama-compatible clients,
+including support for Claude Opus 4.6 models.
+
+PURPOSE
+-------
+- Provide API compatibility layer between Ollama clients and KIE.AI backend
+- Enable transparent model switching without client-side changes
+- Support Claude Opus 4.6 and other advanced language models
+- Maintain performance with minimal latency overhead
+- Enable local development and testing environments
+
+SYSTEM ARCHITECTURE
+================================================================================
+The proxy service will operate as a standalone Python application that:
+
+1. Listens for incoming HTTP requests on a configurable port (default: 11434)
+2. Accepts Ollama-compatible API requests (pull, generate, chat/completions)
+3. Transforms requests into KIE.AI API format
+4. Forwards requests to the KIE.AI backend API
+5. Transforms responses back into Ollama API format
+6. Returns responses to the client
+
+CORE FUNCTIONALITY
+================================================================================
+The proxy must implement the following endpoints:
+
+1. Model Management
+   - GET /api/tags - List available models
+   - POST /api/pull - Pull/download model (stub implementation)
+   - DELETE /api/delete - Delete model (stub implementation)
+   - HEAD /api/blobs/{digest} - Check blob existence
+
+2. Model Inference
+   - POST /api/generate - Generate text completion (streaming)
+   - POST /api/chat/completions - Chat endpoint with messages
+
+3. System Information
+   - GET /api/version - Return service version
+   - GET /health - Health check endpoint
+
+API SPECIFICATIONS
+================================================================================
+Request Format (Ollama Compatible):
+- Content-Type: application/json
+- Support both streaming and non-streaming modes
+- Accept streaming requests with "stream": true parameter
+- Return Server-Sent Events (SSE) format for streaming responses
+
+Response Format:
+- JSON responses matching Ollama API specification
+- Streaming responses in line-delimited JSON format
+- Include proper HTTP status codes and error messages
+- Support response metadata (model name, tokens, timing)
+
+KIE.AI API Integration:
+- Map Ollama model names to KIE.AI model identifiers
+- Transform Ollama message format to KIE.AI request schema
+- Extract relevant fields from KIE.AI responses
+- Handle KIE.AI authentication and API keys
+
+IMPLEMENTATION REQUIREMENTS
+================================================================================
+Framework & Libraries:
+- Python 3.9+
+- Flask or FastAPI for HTTP server
+- Requests library for backend communication
+- Python-dotenv for configuration management
+- Pydantic for request/response validation
+- Support for streaming responses with generators
+
+Configuration:
+- Environment variables for KIE.AI API key
+- Configurable proxy listen port
+- Configurable backend URL
+- Model mapping configuration (Ollama model name → KIE.AI model ID)
+- Logging configuration (level, format)
+
+Request Handling:
+- Request validation and schema verification
+- Proper error handling and status code mapping
+- Request timeout management
+- Connection pooling for backend requests
+- Comprehensive logging of all requests/responses
+
+Response Handling:
+- Stream response processing for large outputs
+- Proper HTTP headers (Content-Type, Transfer-Encoding)
+- Token counting and metadata enrichment
+- Error message transformation
+- Response compression support (optional)
+
+SECURITY REQUIREMENTS
+================================================================================
+- KIE.AI API key management via environment variables (never hardcoded)
+- Request rate limiting (configurable)
+- Input validation and sanitization
+- HTTPS support for production deployment
+- CORS handling if serving web clients
+- Request size limits to prevent abuse
+
+SUPPORTED MODELS
+================================================================================
+- Claude Opus 4.6 (primary)
+- Additional KIE.AI models as available
+- Model alias mapping (e.g., "ollama-neural" → KIE.AI model ID)
+
+TESTING REQUIREMENTS
+================================================================================
+- Unit tests for request/response transformation logic
+- Integration tests against mock KIE.AI API
+- Streaming response handling tests
+- Error condition and edge case tests
+- Load testing for performance validation
+- Compatibility testing with Ollama clients
+
+DEPLOYMENT
+================================================================================
+- Docker containerization support
+- Environment-based configuration
+- Graceful shutdown handling
+- Health check endpoints for orchestration
+- Logging and monitoring integration points
+
+DOCUMENTATION
+================================================================================
+- README with installation and usage instructions
+- API endpoint documentation
+- Configuration guide
+- Example requests/responses
+- Docker deployment instructions
+- Troubleshooting guide
+
+FUTURE ENHANCEMENTS
+================================================================================
+- Multiple backend support (fallback routing)
+- Response caching layer
+- Advanced model parameter mapping
+- Batch request processing
+- Metrics and monitoring integration
+- WebSocket support for persistent connections
