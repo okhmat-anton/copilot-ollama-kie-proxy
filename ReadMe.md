@@ -11,7 +11,15 @@ A lightweight, asynchronous Python proxy service that emulates the Ollama API an
 - `/api/pull`, `/api/delete` - Model management (stub implementations)
 - `/api/version`, `/health` - System endpoints
 
-🚀 **Async/Await Architecture**
+� **OpenAI API Compatibility** _(New!)_
+- `/v1/models` - List models in OpenAI format
+- `/v1/chat/completions` - OpenAI SDK compatible chat endpoint
+- `/v1/completions` - OpenAI SDK compatible completions endpoint
+- `/v1/embeddings` - OpenAI SDK compatible embeddings endpoint
+- Full support for [OpenAI Python SDK](https://github.com/openai/openai-python)
+- See [OPENAI_COMPATIBILITY.md](OPENAI_COMPATIBILITY.md) for details
+
+�🚀 **Async/Await Architecture**
 - Built with FastAPI and asyncio for high concurrency
 - Streaming support for real-time responses
 - Connection pooling for efficient backend communication
