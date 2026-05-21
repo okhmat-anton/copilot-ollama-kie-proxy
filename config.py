@@ -25,7 +25,7 @@ class Settings:
         # Model Configuration
         self.default_model = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
         # Ollama compatibility version returned by /api/version
-        self.ollama_compat_version = os.getenv("OLLAMA_COMPAT_VERSION", "0.5.1")
+        self.ollama_compat_version = os.getenv("OLLAMA_COMPAT_VERSION", "0.8.0")
         
         # Ensure log directory exists
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)

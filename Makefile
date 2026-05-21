@@ -5,7 +5,7 @@ SHELL := /bin/bash
 VENV := venv
 PYTHON := $(VENV)/bin/python
 PIP := $(VENV)/bin/pip
-PORT := 11434
+PORT := $(shell $(PYTHON) -c "from dotenv import load_dotenv; import os; load_dotenv(); print(os.getenv('PROXY_PORT', '11434'))" 2>/dev/null || echo 11434)
 
 help: ## Show this help message
 	@echo "Available commands:"
