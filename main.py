@@ -1,23 +1,28 @@
+"""
+Ollama-compatible proxy for KIE.AI API
+Full Ollama API compatibility with async streaming support
+"""
+
 import json
 import asyncio
 import httpx
-from typing import Any, AsyncGenerator
+from typing import Any
 from datetime import datetime
 from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
 from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 from config import settings
 from logger import general_logger, error_logger, request_logger
 
 # Initialize FastAPI app
-app = FastAPI(title="Ollama-KIE.AI Proxy", version="1.0.0")
+app = FastAPI(title="Ollama", version="0.1.0")
 
 # HTTP client session
 http_client: httpx.AsyncClient | None = None
 
 
 # ============================================================================
-# Request/Response Models
+# Request/Response Models (Ollama Compatible)
 # ============================================================================
 
 class Message(BaseModel):
@@ -31,9 +36,9 @@ class ChatRequest(BaseModel):
     model: str
     messages: list[Message]
     stream: bool = False
-    temperature: float = 0.7
-    top_p: float = 0.9
-    max_tokens: int = 2048
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: int = Field(default=40, ge=1)
 
 
 class GenerateRequest(BaseModel):
@@ -41,25 +46,39 @@ class GenerateRequest(BaseModel):
     model: str
     prompt: str
     stream: bool = False
-    temperature: float = 0.7
-    top_p: float = 0.9
+    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
+    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
+    top_k: int = Field(default=40, ge=1)
 
 
-class TagsResponse(BaseModel):
-    """Available models response"""
-    models: list[dict]
+class PullRequest(BaseModel):
+    """Pull/download model request"""
+    name: str
+    insecure: bool = False
+
+
+class DeleteRequest(BaseModel):
+    """Delete model request"""
+    name: str
+
+
+class EmbeddingsRequest(BaseModel):
+    """Embeddings request"""
+    model: str
+    input: str | list[str]
 
 
 # ============================================================================
 # Logging Helpers
 # ============================================================================
 
-async def log_request(method: str, path: str, details: dict):
+async def log_request(method: str, path: str, details: dict = None):
     """Log incoming request"""
     timestamp = datetime.now().isoformat()
+    model = (details or {}).get('model', 'N/A')
+    stream = (details or {}).get('stream', False)
     request_logger.info(
-        f"[{timestamp}] {method} {path} | Model: {details.get('model', 'N/A')} | "
-        f"Stream: {details.get('stream', False)}"
+        f"[{timestamp}] {method} {path} | Model: {model} | Stream: {stream}"
     )
 
 
@@ -113,9 +132,6 @@ async def transform_ollama_to_kie(
             {"role": "user", "content": prompt}
         ]
     
-    if "max_tokens" in kwargs:
-        kie_request["max_tokens"] = kwargs["max_tokens"]
-    
     return kie_request
 
 
@@ -126,21 +142,44 @@ async def transform_kie_to_ollama(
     """Transform KIE.AI response to Ollama format"""
     
     if is_streaming:
+        content = ""
+        finish_reason = None
+        
+        if "choices" in kie_response and len(kie_response["choices"]) > 0:
+            choice = kie_response["choices"][0]
+            if "delta" in choice:
+                content = choice["delta"].get("content", "")
+            if "finish_reason" in choice:
+                finish_reason = choice["finish_reason"]
+        
         return {
             "model": kie_response.get("model", settings.default_model),
             "created_at": datetime.now().isoformat(),
-            "response": kie_response.get("choices", [{}])[0].get("delta", {}).get("content", ""),
-            "done": kie_response.get("choices", [{}])[0].get("finish_reason") == "stop"
+            "message": {
+                "role": "assistant",
+                "content": content
+            },
+            "done": finish_reason == "stop",
+            "done_reason": finish_reason or "null"
         }
     else:
-        content = kie_response.get("choices", [{}])[0].get("message", {}).get("content", "")
+        content = ""
+        if "choices" in kie_response and len(kie_response["choices"]) > 0:
+            choice = kie_response["choices"][0]
+            if "message" in choice:
+                content = choice["message"].get("content", "")
+            elif "text" in choice:
+                content = choice["text"]
+        
         return {
             "model": kie_response.get("model", settings.default_model),
             "created_at": datetime.now().isoformat(),
-            "response": content,
+            "message": {
+                "role": "assistant",
+                "content": content
+            },
             "done": True,
-            "context": [],
-            "total_duration": kie_response.get("usage", {}).get("total_tokens", 0) * 1000
+            "done_reason": "stop"
         }
 
 
@@ -148,7 +187,7 @@ async def stream_kie_response(
     url: str,
     request_data: dict,
     model: str
-) -> AsyncGenerator[str, None]:
+):
     """Stream responses from KIE.AI API"""
     
     try:
@@ -176,11 +215,53 @@ async def stream_kie_response(
 
 
 # ============================================================================
-# API Endpoints - Model Management
+# Lifecycle Events
 # ============================================================================
 
+@app.on_event("startup")
+async def startup_event():
+    """Initialize on startup"""
+    global http_client
+    
+    if not settings.kie_ai_api_key:
+        raise ValueError("KIE_AI_API_KEY environment variable is not set")
+    
+    general_logger.info(
+        f"Ollama-compatible proxy starting"
+    )
+    general_logger.info(f"Backend: {settings.kie_ai_api_url}")
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    """Cleanup on shutdown"""
+    global http_client
+    
+    if http_client:
+        await http_client.aclose()
+    
+    general_logger.info("Ollama-compatible proxy shutting down")
+
+
+# ============================================================================
+# API Endpoints - System Information
+# ============================================================================
+
+@app.get("/", include_in_schema=False)
+async def root():
+    """Root endpoint"""
+    return {"status": "Ollama is running"}
+
+
+@app.get("/api/version")
+async def api_version():
+    """Get API version (Ollama compatible)"""
+    # Return an Ollama-compatible version string. Allow override via env var.
+    return {"version": settings.ollama_compat_version}
+
+
 @app.get("/api/tags")
-async def list_models(background_tasks: BackgroundTasks) -> dict:
+async def list_models():
     """List available models (Ollama compatible)"""
     
     await log_request("GET", "/api/tags", {})
@@ -197,61 +278,68 @@ async def list_models(background_tasks: BackgroundTasks) -> dict:
             ]
         }
     except Exception as e:
-        background_tasks.add_task(log_error, "TAGS_ERROR", str(e), {})
+        await log_error("TAGS_ERROR", str(e), {})
         raise HTTPException(status_code=500, detail="Failed to list models")
 
 
+# ============================================================================
+# API Endpoints - Model Management
+# ============================================================================
+
 @app.post("/api/pull")
-async def pull_model(request: Request, background_tasks: BackgroundTasks) -> dict:
+async def pull_model(request: PullRequest, background_tasks: BackgroundTasks):
     """Pull model (stub - no actual download needed)"""
     
-    body = await request.json()
-    await log_request("POST", "/api/pull", {"model": body.get("name")})
+    await log_request("POST", "/api/pull", {"model": request.name})
     
-    return {"status": "success"}
+    return {
+        "status": "success",
+        "digest": f"sha256:{request.name}",
+        "total": 0
+    }
 
 
 @app.delete("/api/delete")
-async def delete_model(request: Request, background_tasks: BackgroundTasks) -> dict:
+async def delete_model(request: DeleteRequest, background_tasks: BackgroundTasks):
     """Delete model (stub implementation)"""
     
-    body = await request.json()
-    await log_request("DELETE", "/api/delete", {"model": body.get("name")})
+    await log_request("DELETE", "/api/delete", {"model": request.name})
     
     return {"status": "success"}
 
 
 @app.head("/api/blobs/{digest}")
-async def check_blob(digest: str) -> dict:
+async def check_blob(digest: str):
     """Check blob existence"""
-    return {"exists": True}
+    return {}
 
 
 # ============================================================================
-# API Endpoints - Model Inference
+# API Endpoints - Chat/Completions
 # ============================================================================
 
-@app.post("/api/generate")
-async def generate(
-    request: GenerateRequest,
-    background_tasks: BackgroundTasks
-) -> StreamingResponse | dict:
-    """Generate text completion (Ollama compatible)"""
+@app.post("/api/chat", response_model=None)
+async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
+    """Chat endpoint - main Ollama chat API"""
     
-    await log_request("POST", "/api/generate", {
+    await log_request("POST", "/api/chat", {
         "model": request.model,
-        "stream": request.stream
+        "stream": request.stream,
+        "messages_count": len(request.messages)
     })
     
     try:
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
         kie_request = await transform_ollama_to_kie(
             model=request.model,
-            prompt=request.prompt,
+            messages=messages,
             temperature=request.temperature,
-            top_p=request.top_p
+            top_p=request.top_p,
+            top_k=request.top_k
         )
         
-        url = f"{settings.kie_ai_api_url}/completions"
+        url = f"{settings.kie_ai_api_url}/chat/completions"
         
         if request.stream:
             return StreamingResponse(
@@ -264,7 +352,7 @@ async def generate(
             
             if response.status_code != 200:
                 error_msg = f"KIE.AI API error: {response.status_code}"
-                background_tasks.add_task(log_error, "GENERATE_ERROR", error_msg, {})
+                background_tasks.add_task(log_error, "CHAT_ERROR", error_msg, {})
                 raise HTTPException(status_code=response.status_code, detail=error_msg)
             
             kie_response = response.json()
@@ -272,16 +360,13 @@ async def generate(
             return ollama_response
     
     except Exception as e:
-        background_tasks.add_task(log_error, "GENERATE_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Generation failed")
+        background_tasks.add_task(log_error, "CHAT_EXCEPTION", str(e), {})
+        raise HTTPException(status_code=500, detail="Chat failed")
 
 
-@app.post("/api/chat/completions")
-async def chat_completions(
-    request: ChatRequest,
-    background_tasks: BackgroundTasks
-) -> StreamingResponse | dict:
-    """Chat endpoint (Ollama compatible)"""
+@app.post("/api/chat/completions", response_model=None)
+async def chat_completions(request: ChatRequest, background_tasks: BackgroundTasks):
+    """Chat completions endpoint (OpenAI compatible)"""
     
     await log_request("POST", "/api/chat/completions", {
         "model": request.model,
@@ -297,7 +382,7 @@ async def chat_completions(
             messages=messages,
             temperature=request.temperature,
             top_p=request.top_p,
-            max_tokens=request.max_tokens
+            top_k=request.top_k
         )
         
         url = f"{settings.kie_ai_api_url}/chat/completions"
@@ -326,55 +411,283 @@ async def chat_completions(
 
 
 # ============================================================================
-# API Endpoints - System
+# API Endpoints - Generate (Legacy)
 # ============================================================================
 
-@app.get("/api/version")
-async def get_version() -> dict:
-    """Get service version"""
-    return {
-        "version": "1.0.0",
-        "backend": "KIE.AI",
-        "models": ["claude-opus-4-6"]
-    }
+@app.post("/api/generate", response_model=None)
+async def generate(request: GenerateRequest, background_tasks: BackgroundTasks):
+    """Generate text completion (Ollama compatible)"""
+    
+    await log_request("POST", "/api/generate", {
+        "model": request.model,
+        "stream": request.stream
+    })
+    
+    try:
+        kie_request = await transform_ollama_to_kie(
+            model=request.model,
+            prompt=request.prompt,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k
+        )
+        
+        url = f"{settings.kie_ai_api_url}/completions"
+        
+        if request.stream:
+            return StreamingResponse(
+                stream_kie_response(url, kie_request, request.model),
+                media_type="application/x-ndjson"
+            )
+        else:
+            client = await get_http_client()
+            response = await client.post(url, json=kie_request)
+            
+            if response.status_code != 200:
+                error_msg = f"KIE.AI API error: {response.status_code}"
+                background_tasks.add_task(log_error, "GENERATE_ERROR", error_msg, {})
+                raise HTTPException(status_code=response.status_code, detail=error_msg)
+            
+            kie_response = response.json()
+            ollama_response = await transform_kie_to_ollama(kie_response)
+            return ollama_response
+    
+    except Exception as e:
+        background_tasks.add_task(log_error, "GENERATE_EXCEPTION", str(e), {})
+        raise HTTPException(status_code=500, detail="Generation failed")
 
 
-@app.get("/health")
-async def health_check() -> dict:
+# ============================================================================
+# API Endpoints - Embeddings
+# ============================================================================
+
+@app.post("/api/embeddings", response_model=None)
+async def embeddings(request: EmbeddingsRequest, background_tasks: BackgroundTasks):
+    """Generate embeddings"""
+    
+    await log_request("POST", "/api/embeddings", {
+        "model": request.model
+    })
+    
+    try:
+        # For now, return dummy embeddings
+        # In production, call KIE.AI embeddings API if available
+        return {
+            "embedding": [0.1] * 1536,
+            "model": request.model
+        }
+    except Exception as e:
+        background_tasks.add_task(log_error, "EMBEDDINGS_ERROR", str(e), {})
+        raise HTTPException(status_code=500, detail="Embeddings generation failed")
+
+
+# ============================================================================
+# API Endpoints - Health/Status
+# ============================================================================
+
+@app.get("/health", include_in_schema=False)
+@app.get("/api/health")
+async def health_check():
     """Health check endpoint"""
     return {
-        "status": "healthy",
+        "status": "ok",
         "timestamp": datetime.now().isoformat()
     }
 
 
 # ============================================================================
-# Lifecycle Events
+# OpenAI Compatible Endpoints (/v1/* prefix)
 # ============================================================================
 
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
-    global http_client
+@app.get("/v1/models", include_in_schema=False)
+async def openai_list_models():
+    """List available models (OpenAI compatible endpoint)"""
     
-    if not settings.kie_ai_api_key:
-        raise ValueError("KIE_AI_API_KEY environment variable is not set")
+    await log_request("GET", "/v1/models", {})
     
-    general_logger.info(
-        f"Ollama-KIE.AI Proxy starting on {settings.proxy_host}:{settings.proxy_port}"
+    try:
+        return {
+            "object": "list",
+            "data": [
+                {
+                    "id": "claude-opus-4-6",
+                    "object": "model",
+                    "owned_by": "kie-ai",
+                    "created": int(datetime.now().timestamp()),
+                    "permission": []
+                }
+            ]
+        }
+    except Exception as e:
+        await log_error("V1_MODELS_ERROR", str(e), {})
+        raise HTTPException(status_code=500, detail="Failed to list models")
+
+
+@app.get("/v1/models/{model}", include_in_schema=False)
+async def openai_get_model(model: str):
+    """Get model information (OpenAI compatible endpoint)"""
+    
+    await log_request("GET", f"/v1/models/{model}", {})
+    
+    try:
+        return {
+            "id": model,
+            "object": "model",
+            "owned_by": "kie-ai",
+            "created": int(datetime.now().timestamp()),
+            "permission": []
+        }
+    except Exception as e:
+        await log_error("V1_MODEL_ERROR", str(e), {"model": model})
+        raise HTTPException(status_code=500, detail="Failed to get model info")
+
+
+@app.post("/v1/chat/completions", include_in_schema=False)
+async def openai_chat_completions(request: ChatRequest, background_tasks: BackgroundTasks):
+    """Chat completions endpoint (OpenAI compatible /v1/ prefix)"""
+    
+    await log_request("POST", "/v1/chat/completions", {
+        "model": request.model,
+        "stream": request.stream,
+        "messages_count": len(request.messages)
+    })
+    
+    try:
+        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
+        
+        kie_request = await transform_ollama_to_kie(
+            model=request.model,
+            messages=messages,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k
+        )
+        
+        url = f"{settings.kie_ai_api_url}/chat/completions"
+        
+        if request.stream:
+            return StreamingResponse(
+                stream_kie_response(url, kie_request, request.model),
+                media_type="application/x-ndjson"
+            )
+        else:
+            client = await get_http_client()
+            response = await client.post(url, json=kie_request)
+            
+            if response.status_code != 200:
+                error_msg = f"KIE.AI API error: {response.status_code}"
+                background_tasks.add_task(log_error, "V1_CHAT_ERROR", error_msg, {})
+                raise HTTPException(status_code=response.status_code, detail=error_msg)
+            
+            kie_response = response.json()
+            ollama_response = await transform_kie_to_ollama(kie_response)
+            return ollama_response
+    
+    except Exception as e:
+        background_tasks.add_task(log_error, "V1_CHAT_EXCEPTION", str(e), {})
+        raise HTTPException(status_code=500, detail="Chat failed")
+
+
+@app.post("/v1/completions", include_in_schema=False)
+async def openai_completions(request: GenerateRequest, background_tasks: BackgroundTasks):
+    """Completions endpoint (OpenAI compatible /v1/ prefix)"""
+    
+    await log_request("POST", "/v1/completions", {
+        "model": request.model,
+        "stream": request.stream
+    })
+    
+    try:
+        kie_request = await transform_ollama_to_kie(
+            model=request.model,
+            prompt=request.prompt,
+            temperature=request.temperature,
+            top_p=request.top_p,
+            top_k=request.top_k
+        )
+        
+        url = f"{settings.kie_ai_api_url}/chat/completions"
+        
+        if request.stream:
+            return StreamingResponse(
+                stream_kie_response(url, kie_request, request.model),
+                media_type="application/x-ndjson"
+            )
+        else:
+            client = await get_http_client()
+            response = await client.post(url, json=kie_request)
+            
+            if response.status_code != 200:
+                error_msg = f"KIE.AI API error: {response.status_code}"
+                background_tasks.add_task(log_error, "V1_COMPLETIONS_ERROR", error_msg, {})
+                raise HTTPException(status_code=response.status_code, detail=error_msg)
+            
+            kie_response = response.json()
+            ollama_response = await transform_kie_to_ollama(kie_response)
+            return ollama_response
+    
+    except Exception as e:
+        background_tasks.add_task(log_error, "V1_COMPLETIONS_EXCEPTION", str(e), {})
+        raise HTTPException(status_code=500, detail="Completions failed")
+
+
+@app.post("/v1/embeddings", include_in_schema=False)
+async def openai_embeddings(request: EmbeddingsRequest, background_tasks: BackgroundTasks):
+    """Embeddings endpoint (OpenAI compatible /v1/ prefix)"""
+    
+    await log_request("POST", "/v1/embeddings", {"model": request.model})
+    
+    try:
+        # Normalize input to list
+        if isinstance(request.input, str):
+            inputs = [request.input]
+        else:
+            inputs = request.input
+        
+        client = await get_http_client()
+        url = f"{settings.kie_ai_api_url}/embeddings"
+        
+        kie_request = {
+            "model": request.model,
+            "input": inputs
+        }
+        
+        response = await client.post(url, json=kie_request)
+        
+        if response.status_code != 200:
+            error_msg = f"KIE.AI API error: {response.status_code}"
+            background_tasks.add_task(log_error, "V1_EMBEDDINGS_ERROR", error_msg, {})
+            raise HTTPException(status_code=response.status_code, detail=error_msg)
+        
+        return response.json()
+    
+    except Exception as e:
+        background_tasks.add_task(log_error, "V1_EMBEDDINGS_EXCEPTION", str(e), {})
+        raise HTTPException(status_code=500, detail="Embeddings generation failed")
+
+
+# ============================================================================
+# Error Handlers
+# ============================================================================
+
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Custom HTTP exception handler"""
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={"error": exc.detail}
     )
-    general_logger.info(f"Backend URL: {settings.kie_ai_api_url}")
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    global http_client
-    
-    if http_client:
-        await http_client.aclose()
-    
-    general_logger.info("Ollama-KIE.AI Proxy shutting down")
+@app.exception_handler(Exception)
+async def general_exception_handler(request: Request, exc: Exception):
+    """General exception handler"""
+    error_msg = str(exc)
+    await log_error("UNHANDLED_EXCEPTION", error_msg, {})
+    return JSONResponse(
+        status_code=500,
+        content={"error": "Internal server error"}
+    )
 
 
 # ============================================================================

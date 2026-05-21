@@ -1,22 +1,23 @@
 .PHONY: install start stop restart clean logs help
 
 # Variables
-PYTHON := python3
-PIP := pip3
+SHELL := /bin/bash
 VENV := venv
+PYTHON := $(VENV)/bin/python
+PIP := $(VENV)/bin/pip
 PORT := 11434
 
 help: ## Show this help message
 	@echo "Available commands:"
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-20s\033[0m %s\n", $$1, $$2}'
 
-install: ## Install dependencies
+venv: ## Create virtual environment
+	python3 -m venv $(VENV)
+	@echo "✓ Virtual environment created"
+
+install: venv ## Install dependencies
 	$(PIP) install -r requirements.txt
 	@echo "✓ Dependencies installed"
-
-venv: ## Create virtual environment
-	$(PYTHON) -m venv $(VENV)
-	@echo "✓ Virtual environment created"
 
 venv-activate: ## Activate virtual environment
 	@echo "Run: source $(VENV)/bin/activate"
@@ -75,22 +76,22 @@ logs-requests: ## View request logs
 
 test-health: ## Test health check endpoint
 	@echo "Testing health endpoint..."
-	@curl -s http://127.0.0.1:$(PORT)/health | python -m json.tool || echo "Service not running"
+	@curl -s http://127.0.0.1:$(PORT)/health | $(PYTHON) -m json.tool || echo "Service not running"
 
 test-tags: ## Test list models endpoint
 	@echo "Testing list models endpoint..."
-	@curl -s http://127.0.0.1:$(PORT)/api/tags | python -m json.tool || echo "Service not running"
+	@curl -s http://127.0.0.1:$(PORT)/api/tags | $(PYTHON) -m json.tool || echo "Service not running"
 
 requirements: ## Generate/update requirements.txt from installed packages
 	$(PIP) freeze > requirements.txt
 	@echo "✓ requirements.txt updated"
 
 lint: ## Run Python linter
-	@command -v pylint >/dev/null 2>&1 && pylint main.py config.py logger.py || \
+	@command -v pylint >/dev/null 2>&1 && $(VENV)/bin/pylint main.py config.py logger.py || \
 		echo "pylint not installed. Run: pip install pylint"
 
 format: ## Format Python code
-	@command -v black >/dev/null 2>&1 && black main.py config.py logger.py || \
+	@command -v black >/dev/null 2>&1 && $(VENV)/bin/black main.py config.py logger.py || \
 		echo "black not installed. Run: pip install black"
 
 all: install env-setup ## Install dependencies and setup environment

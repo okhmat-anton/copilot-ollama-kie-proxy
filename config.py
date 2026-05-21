@@ -1,32 +1,33 @@
 import os
 from pathlib import Path
-from pydantic_settings import BaseSettings
+from dotenv import load_dotenv
+
+# Load .env file
+load_dotenv()
 
 
-class Settings(BaseSettings):
+class Settings:
     """Application configuration from environment variables"""
     
-    # KIE.AI API Configuration
-    kie_ai_api_key: str = ""
-    kie_ai_api_url: str = "https://api.kie.ai/v1"
-    
-    # Proxy Service Configuration
-    proxy_host: str = "127.0.0.1"
-    proxy_port: int = 11434
-    
-    # Logging Configuration
-    log_level: str = "INFO"
-    log_dir: str = "./logs"
-    
-    # Model Configuration
-    default_model: str = "claude-opus-4-6"
-    
-    class Config:
-        env_file = ".env"
-        case_sensitive = False
-    
-    def __post_init__(self):
-        """Ensure log directory exists"""
+    def __init__(self):
+        # KIE.AI API Configuration
+        self.kie_ai_api_key = os.getenv("KIE_AI_API_KEY", "")
+        self.kie_ai_api_url = os.getenv("KIE_AI_API_URL", "https://api.kie.ai/v1")
+        
+        # Proxy Service Configuration
+        self.proxy_host = os.getenv("PROXY_HOST", "127.0.0.1")
+        self.proxy_port = int(os.getenv("PROXY_PORT", "11434"))
+        
+        # Logging Configuration
+        self.log_level = os.getenv("LOG_LEVEL", "INFO")
+        self.log_dir = os.getenv("LOG_DIR", "./logs")
+        
+        # Model Configuration
+        self.default_model = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")
+        # Ollama compatibility version returned by /api/version
+        self.ollama_compat_version = os.getenv("OLLAMA_COMPAT_VERSION", "0.5.1")
+        
+        # Ensure log directory exists
         Path(self.log_dir).mkdir(parents=True, exist_ok=True)
 
 
