@@ -62,6 +62,11 @@ class DeleteRequest(BaseModel):
     name: str
 
 
+class ShowRequest(BaseModel):
+    """Show model details request"""
+    name: str
+
+
 class EmbeddingsRequest(BaseModel):
     """Embeddings request"""
     model: str
@@ -306,6 +311,31 @@ async def delete_model(request: DeleteRequest, background_tasks: BackgroundTasks
     await log_request("DELETE", "/api/delete", {"model": request.name})
     
     return {"status": "success"}
+
+
+@app.post("/api/show")
+async def show_model(request: ShowRequest):
+    """Show model details (Ollama compatible)"""
+    
+    await log_request("POST", "/api/show", {"model": request.name})
+    
+    try:
+        # Return model information in Ollama format
+        return {
+            "name": request.name,
+            "modified_at": datetime.now().isoformat(),
+            "size": 0,
+            "digest": f"sha256:{request.name}",
+            "details": {
+                "family": "claude",
+                "families": ["claude"],
+                "parameter_size": "large",
+                "quantization_level": "none"
+            }
+        }
+    except Exception as e:
+        await log_error("SHOW_ERROR", str(e), {"model": request.name})
+        raise HTTPException(status_code=500, detail="Failed to show model")
 
 
 @app.head("/api/blobs/{digest}")
