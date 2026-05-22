@@ -26,6 +26,10 @@ async def full_request_logging_middleware(request: Request, call_next):
         try:
             if settings.request_log_body:
                 body_bytes = await request.body()
+                # Rebuild receive so downstream handlers can still read the body
+                async def receive():
+                    return {"type": "http.request", "body": body_bytes, "more_body": False}
+                request._receive = receive
         except Exception:
             body_bytes = b""
 
@@ -236,15 +240,31 @@ async def stream_kie_response(
                 error_msg = f"KIE.AI API error: {response.status_code}"
                 await log_error("API_ERROR", error_msg, {"url": url})
                 raise HTTPException(status_code=response.status_code, detail=error_msg)
-            
+
             async for line in response.aiter_lines():
-                if line:
-                    try:
-                        kie_chunk = json.loads(line)
-                        ollama_chunk = await transform_kie_to_ollama(kie_chunk, is_streaming=True)
-                        yield f"{json.dumps(ollama_chunk)}\n"
-                    except json.JSONDecodeError:
-                        continue
+                if not line:
+                    continue
+                # Strip SSE "data: " prefix (OpenAI-compatible APIs use SSE format)
+                if line.startswith("data: "):
+                    line = line[6:]
+                if line == "[DONE]":
+                    break
+                try:
+                    kie_chunk = json.loads(line)
+                    ollama_chunk = await transform_kie_to_ollama(kie_chunk, is_streaming=True)
+                    yield f"{json.dumps(ollama_chunk)}\n"
+                except json.JSONDecodeError:
+                    continue
+
+            # Always send the final done message so clients don't hang
+            done_chunk = {
+                "model": model,
+                "created_at": datetime.now().isoformat(),
+                "message": {"role": "assistant", "content": ""},
+                "done": True,
+                "done_reason": "stop"
+            }
+            yield f"{json.dumps(done_chunk)}\n"
     
     except httpx.RequestError as e:
         await log_error("REQUEST_ERROR", str(e), {"url": url})
@@ -308,9 +328,18 @@ async def list_models():
             "models": [
                 {
                     "name": "claude-opus-4-6:latest",
+                    "model": "claude-opus-4-6:latest",
                     "modified_at": datetime.now().isoformat(),
                     "size": 0,
-                    "digest": "sha256:claude-opus-4-6"
+                    "digest": "sha256:claude-opus-4-6",
+                    "details": {
+                        "parent_model": "",
+                        "format": "api",
+                        "family": "claude",
+                        "families": ["claude"],
+                        "parameter_size": "unknown",
+                        "quantization_level": "none"
+                    }
                 }
             ]
         }
@@ -376,16 +405,22 @@ async def show_model(request: Request):
         await log_request("POST", "/api/show", {"model": model_name})
         
         return {
-            "name": model_name,
-            "modified_at": datetime.now().isoformat(),
-            "size": 0,
-            "digest": f"sha256:{model_name}",
+            "modelfile": f"FROM {model_name}",
+            "parameters": "",
+            "template": "{{ .Prompt }}",
             "details": {
+                "parent_model": "",
+                "format": "api",
                 "family": "claude",
                 "families": ["claude"],
-                "parameter_size": "large",
+                "parameter_size": "unknown",
                 "quantization_level": "none"
-            }
+            },
+            "model_info": {
+                "general.architecture": "claude",
+                "llm.context_length": 200000
+            },
+            "capabilities": ["completion", "tools"]
         }
     except HTTPException:
         raise
