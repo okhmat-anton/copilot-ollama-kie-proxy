@@ -314,18 +314,40 @@ async def delete_model(request: DeleteRequest, background_tasks: BackgroundTasks
 
 
 @app.post("/api/show")
-async def show_model(request: ShowRequest):
+async def show_model(request: Request):
     """Show model details (Ollama compatible)"""
     
-    await log_request("POST", "/api/show", {"model": request.name})
-    
+    raw_body = b""
     try:
-        # Return model information in Ollama format
+        raw_body = await request.body()
+        model_name = None
+        content_type = request.headers.get("content-type", "")
+        
+        if raw_body:
+            if "application/json" in content_type:
+                body = await request.json()
+                if isinstance(body, dict):
+                    model_name = body.get("name") or body.get("model")
+            elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
+                form = await request.form()
+                model_name = form.get("name") or form.get("model")
+        
+        if not model_name:
+            model_name = request.query_params.get("name") or request.query_params.get("model")
+        
+        if not model_name:
+            raise HTTPException(
+                status_code=400,
+                detail="Model name is required in JSON body, form body, or query parameters"
+            )
+        
+        await log_request("POST", "/api/show", {"model": model_name})
+        
         return {
-            "name": request.name,
+            "name": model_name,
             "modified_at": datetime.now().isoformat(),
             "size": 0,
-            "digest": f"sha256:{request.name}",
+            "digest": f"sha256:{model_name}",
             "details": {
                 "family": "claude",
                 "families": ["claude"],
@@ -333,8 +355,17 @@ async def show_model(request: ShowRequest):
                 "quantization_level": "none"
             }
         }
+    except HTTPException:
+        raise
     except Exception as e:
-        await log_error("SHOW_ERROR", str(e), {"model": request.name})
+        await log_error(
+            "SHOW_ERROR",
+            str(e),
+            {
+                "content_type": content_type,
+                "body": raw_body.decode("utf-8", errors="replace")
+            }
+        )
         raise HTTPException(status_code=500, detail="Failed to show model")
 
 
