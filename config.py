@@ -21,6 +21,10 @@ class Settings:
         # Logging Configuration
         self.log_level = os.getenv("LOG_LEVEL", "INFO")
         self.log_dir = os.getenv("LOG_DIR", "./logs")
+        self.request_logging_enabled = os.getenv("REQUEST_LOGGING_ENABLED", "true").lower() in ("1", "true", "yes")
+        self.request_log_headers = os.getenv("REQUEST_LOG_HEADERS", "true").lower() in ("1", "true", "yes")
+        self.request_log_body = os.getenv("REQUEST_LOG_BODY", "true").lower() in ("1", "true", "yes")
+        self.request_log_body_limit = int(os.getenv("REQUEST_LOG_BODY_LIMIT", "4096"))
         
         # Model Configuration
         self.default_model = os.getenv("DEFAULT_MODEL", "claude-opus-4-6")

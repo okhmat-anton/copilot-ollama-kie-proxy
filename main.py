@@ -17,6 +17,38 @@ from logger import general_logger, error_logger, request_logger
 # Initialize FastAPI app
 app = FastAPI(title="Ollama", version="0.1.0")
 
+@app.middleware("http")
+async def full_request_logging_middleware(request: Request, call_next):
+    """Log incoming requests with optional headers and body."""
+    if settings.request_logging_enabled:
+        content_type = request.headers.get("content-type", "")
+        body_bytes = b""
+        try:
+            if settings.request_log_body:
+                body_bytes = await request.body()
+        except Exception:
+            body_bytes = b""
+
+        request_data = {
+            "method": request.method,
+            "path": request.url.path,
+            "query_params": dict(request.query_params),
+            "client": request.client.host if request.client else None,
+        }
+
+        if settings.request_log_headers:
+            request_data["headers"] = dict(request.headers)
+
+        if settings.request_log_body:
+            raw_body = body_bytes.decode("utf-8", errors="replace")
+            request_data["body"] = raw_body[:settings.request_log_body_limit]
+            request_data["body_truncated"] = len(raw_body) > settings.request_log_body_limit
+
+        request_logger.info(json.dumps(request_data, ensure_ascii=False))
+
+    response = await call_next(request)
+    return response
+
 # HTTP client session
 http_client: httpx.AsyncClient | None = None
 
