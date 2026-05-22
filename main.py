@@ -1,834 +1,993 @@
-"""
-Ollama-compatible proxy for KIE.AI API
-Full Ollama API compatibility with async streaming support
-"""
+"""FastAPI-приложение: Ollama-совместимый прокси к KIE.AI.
 
-import json
+Принимает Ollama-API запросы (/api/...) и OpenAI-API запросы (/v1/...),
+проксирует их в KIE.AI (https://api.kie.ai/v1), который OpenAI-совместим.
+Для /api/* выполняет двустороннюю трансформацию форматов.
+"""
+from __future__ import annotations
+
 import asyncio
-import httpx
-from typing import Any
-from datetime import datetime
-from fastapi import FastAPI, Request, HTTPException, BackgroundTasks
-from fastapi.responses import StreamingResponse, JSONResponse
-from pydantic import BaseModel, Field
-from config import settings
-from logger import general_logger, error_logger, request_logger
+import hashlib
+import json
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timezone
+from typing import Any, AsyncIterator, Dict, List, Optional, Tuple
 
-# Initialize FastAPI app
-app = FastAPI(title="Ollama", version="0.1.0")
+import httpx
+from fastapi import FastAPI, HTTPException, Request, Response
+from fastapi.responses import JSONResponse, StreamingResponse
+
+from config import settings
+from logger import (
+    get_error_logger,
+    get_logger,
+    get_request_logger,
+    setup_logging,
+)
+
+setup_logging()
+log = get_logger()
+err_log = get_error_logger()
+req_log = get_request_logger()
+
+
+# --------------------------------------------------------------------------- #
+# HTTP-клиент / жизненный цикл приложения                                     #
+# --------------------------------------------------------------------------- #
+
+_http_client: Optional[httpx.AsyncClient] = None
+
+
+def get_client() -> httpx.AsyncClient:
+    if _http_client is None:
+        raise RuntimeError("HTTP client is not initialized")
+    return _http_client
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    global _http_client
+    log.info(
+        "Starting proxy on %s:%s -> %s",
+        settings.proxy_host,
+        settings.proxy_port,
+        settings.kie_ai_api_url,
+    )
+    if not settings.kie_ai_api_key:
+        log.warning("KIE_AI_API_KEY is empty -- upstream calls will fail")
+
+    _http_client = httpx.AsyncClient(
+        base_url=settings.kie_ai_api_url,
+        timeout=httpx.Timeout(settings.upstream_timeout, connect=15.0),
+        headers={
+            "Authorization": f"Bearer {settings.kie_ai_api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        },
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+    )
+    try:
+        yield
+    finally:
+        log.info("Shutting down proxy")
+        if _http_client is not None:
+            await _http_client.aclose()
+            _http_client = None
+
+
+app = FastAPI(title="copilot-ollama-kie-proxy", lifespan=lifespan)
+
+
+# --------------------------------------------------------------------------- #
+# Middleware -- логирование входящих запросов                                 #
+# --------------------------------------------------------------------------- #
+
 
 @app.middleware("http")
-async def full_request_logging_middleware(request: Request, call_next):
-    """Log incoming requests with optional headers and body."""
-    if settings.request_logging_enabled:
-        content_type = request.headers.get("content-type", "")
-        body_bytes = b""
-        try:
-            if settings.request_log_body:
-                body_bytes = await request.body()
-                # Rebuild receive so downstream handlers can still read the body
-                async def receive():
-                    return {"type": "http.request", "body": body_bytes, "more_body": False}
-                request._receive = receive
-        except Exception:
-            body_bytes = b""
+async def request_logging_middleware(request: Request, call_next):
+    if not settings.request_logging_enabled:
+        return await call_next(request)
 
-        request_data = {
-            "method": request.method,
-            "path": request.url.path,
-            "query_params": dict(request.query_params),
-            "client": request.client.host if request.client else None,
+    start = time.perf_counter()
+    client_ip = request.client.host if request.client else "-"
+    parts = [
+        f"--> {request.method} {request.url.path}",
+        f"query={dict(request.query_params)}",
+        f"client={client_ip}",
+    ]
+
+    if settings.request_log_headers:
+        headers = {
+            k: ("***" if k.lower() in ("authorization", "cookie") else v)
+            for k, v in request.headers.items()
         }
+        parts.append(f"headers={headers}")
 
-        if settings.request_log_headers:
-            request_data["headers"] = dict(request.headers)
+    if settings.request_log_body and request.method in ("POST", "PUT", "PATCH", "DELETE"):
+        try:
+            body = await request.body()
+            if body:
+                text = body.decode("utf-8", errors="replace")
+                if len(text) > settings.request_log_body_limit:
+                    text = text[: settings.request_log_body_limit] + "...<truncated>"
+                parts.append(f"body={text}")
 
-        if settings.request_log_body:
-            raw_body = body_bytes.decode("utf-8", errors="replace")
-            request_data["body"] = raw_body[:settings.request_log_body_limit]
-            request_data["body_truncated"] = len(raw_body) > settings.request_log_body_limit
+                async def receive() -> Dict[str, Any]:
+                    return {"type": "http.request", "body": body, "more_body": False}
 
-        request_logger.info(json.dumps(request_data, ensure_ascii=False))
+                request._receive = receive  # type: ignore[attr-defined]
+        except Exception as exc:
+            parts.append(f"body_error={exc}")
 
-    response = await call_next(request)
+    req_log.info(" | ".join(parts))
+
+    try:
+        response = await call_next(request)
+    except Exception as exc:
+        elapsed_ms = (time.perf_counter() - start) * 1000
+        err_log.exception("Unhandled error %s %s (%.1fms)", request.method, request.url.path, elapsed_ms)
+        req_log.info("<-- %s %s status=500 %.1fms", request.method, request.url.path, elapsed_ms)
+        return JSONResponse(status_code=500, content={"error": str(exc)})
+
+    elapsed_ms = (time.perf_counter() - start) * 1000
+    req_log.info(
+        "<-- %s %s status=%s %.1fms",
+        request.method,
+        request.url.path,
+        response.status_code,
+        elapsed_ms,
+    )
     return response
 
-# HTTP client session
-http_client: httpx.AsyncClient | None = None
+
+# --------------------------------------------------------------------------- #
+# Утилиты                                                                     #
+# --------------------------------------------------------------------------- #
 
 
-# ============================================================================
-# Request/Response Models (Ollama Compatible)
-# ============================================================================
-
-class Message(BaseModel):
-    """Chat message model"""
-    role: str
-    content: str
+def _iso_now() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
 
 
-class ChatRequest(BaseModel):
-    """Chat completion request"""
-    model: str
-    messages: list[Message]
-    stream: bool = False
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
-    top_k: int = Field(default=40, ge=1)
+def _digest_for(name: str) -> str:
+    return "sha256:" + hashlib.sha256(name.encode("utf-8")).hexdigest()
 
 
-class GenerateRequest(BaseModel):
-    """Generate completion request"""
-    model: str
-    prompt: str
-    stream: bool = False
-    temperature: float = Field(default=0.7, ge=0.0, le=2.0)
-    top_p: float = Field(default=0.9, ge=0.0, le=1.0)
-    top_k: int = Field(default=40, ge=1)
-
-
-class PullRequest(BaseModel):
-    """Pull/download model request"""
-    name: str
-    insecure: bool = False
-
-
-class DeleteRequest(BaseModel):
-    """Delete model request"""
-    name: str
-
-
-class ShowRequest(BaseModel):
-    """Show model details request"""
-    name: str
-
-
-class EmbeddingsRequest(BaseModel):
-    """Embeddings request"""
-    model: str
-    input: str | list[str]
-
-
-# ============================================================================
-# Logging Helpers
-# ============================================================================
-
-async def log_request(method: str, path: str, details: dict = None):
-    """Log incoming request"""
-    timestamp = datetime.now().isoformat()
-    model = (details or {}).get('model', 'N/A')
-    stream = (details or {}).get('stream', False)
-    request_logger.info(
-        f"[{timestamp}] {method} {path} | Model: {model} | Stream: {stream}"
-    )
-
-
-async def log_error(error_type: str, message: str, details: dict = None):
-    """Log error"""
-    timestamp = datetime.now().isoformat()
-    error_logger.error(
-        f"[{timestamp}] {error_type}: {message} | Details: {details or {}}"
-    )
-
-
-# ============================================================================
-# KIE.AI API Integration
-# ============================================================================
-
-async def get_http_client() -> httpx.AsyncClient:
-    """Get or create HTTP client"""
-    global http_client
-    if http_client is None:
-        http_client = httpx.AsyncClient(
-            timeout=60.0,
-            headers={
-                "Authorization": f"Bearer {settings.kie_ai_api_key}",
-                "Content-Type": "application/json"
-            }
-        )
-    return http_client
-
-
-async def transform_ollama_to_kie(
-    model: str,
-    messages: list[dict] | None = None,
-    prompt: str | None = None,
-    **kwargs
-) -> dict:
-    """Transform Ollama format request to KIE.AI format"""
-    
-    kie_request = {
-        "model": model,
-        "temperature": kwargs.get("temperature", 0.7),
-        "top_p": kwargs.get("top_p", 0.9),
+def _model_details(name: str) -> Dict[str, Any]:
+    # Подменяем семью на "llama" -- VSCode Copilot ищет в lookup-таблице
+    # хендлеры по семье; для нераспознанных значений падает с
+    # "Cannot read properties of undefined (reading 'bind')".
+    return {
+        "parent_model": "",
+        "format": "gguf",
+        "family": "llama",
+        "families": ["llama"],
+        "parameter_size": "70B",
+        "quantization_level": "Q4_0",
     }
-    
+
+
+def _ollama_model_descriptor(name: str) -> Dict[str, Any]:
+    return {
+        "name": name,
+        "model": name,
+        "modified_at": _iso_now(),
+        "size": 0,
+        "digest": _digest_for(name),
+        "details": _model_details(name),
+    }
+
+
+def _openai_model_descriptor(name: str) -> Dict[str, Any]:
+    return {
+        "id": name,
+        "object": "model",
+        "created": int(time.time()),
+        "owned_by": "kie.ai",
+    }
+
+
+def _model_or_default(name: Optional[str]) -> str:
+    return name or settings.default_model
+
+
+def _strip_tag(name: str) -> str:
+    # Ollama-клиенты часто шлют "model:latest"; KIE такого не знает.
+    if ":" in name and not name.startswith("sha256:"):
+        return name.split(":", 1)[0]
+    return name
+
+
+def _build_messages(prompt: Optional[str], messages: Optional[List[Dict[str, Any]]], system: Optional[str]) -> List[Dict[str, Any]]:
+    out: List[Dict[str, Any]] = []
+    if system:
+        out.append({"role": "system", "content": system})
     if messages:
-        kie_request["messages"] = [
-            {"role": msg["role"], "content": msg["content"]}
-            for msg in messages
-        ]
-    elif prompt:
-        kie_request["messages"] = [
-            {"role": "user", "content": prompt}
-        ]
-    
-    return kie_request
+        out.extend(messages)
+    elif prompt is not None:
+        out.append({"role": "user", "content": prompt})
+    return out
 
 
-async def transform_kie_to_ollama(
-    kie_response: dict,
-    is_streaming: bool = False
-) -> dict:
-    """Transform KIE.AI response to Ollama format"""
-    
-    if is_streaming:
-        content = ""
-        finish_reason = None
-        
-        if "choices" in kie_response and len(kie_response["choices"]) > 0:
-            choice = kie_response["choices"][0]
-            if "delta" in choice:
-                content = choice["delta"].get("content", "")
-            if "finish_reason" in choice:
-                finish_reason = choice["finish_reason"]
-        
-        return {
-            "model": kie_response.get("model", settings.default_model),
-            "created_at": datetime.now().isoformat(),
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
-            "done": finish_reason == "stop",
-            "done_reason": finish_reason or "null"
-        }
-    else:
-        content = ""
-        if "choices" in kie_response and len(kie_response["choices"]) > 0:
-            choice = kie_response["choices"][0]
-            if "message" in choice:
-                content = choice["message"].get("content", "")
-            elif "text" in choice:
-                content = choice["text"]
-        
-        return {
-            "model": kie_response.get("model", settings.default_model),
-            "created_at": datetime.now().isoformat(),
-            "message": {
-                "role": "assistant",
-                "content": content
-            },
-            "done": True,
-            "done_reason": "stop"
-        }
+def _extract_sampling(body: Dict[str, Any]) -> Dict[str, Any]:
+    """Достаёт параметры сэмплинга из тела (учитывая Ollama `options`)."""
+    opts = body.get("options") or {}
+    out: Dict[str, Any] = {}
+
+    def pick(key: str, *aliases: str) -> Any:
+        for k in (key, *aliases):
+            if k in body and body[k] is not None:
+                return body[k]
+            if k in opts and opts[k] is not None:
+                return opts[k]
+        return None
+
+    temperature = pick("temperature")
+    if temperature is not None:
+        out["temperature"] = float(temperature)
+    top_p = pick("top_p")
+    if top_p is not None:
+        out["top_p"] = float(top_p)
+    max_tokens = pick("max_tokens", "num_predict")
+    if max_tokens is not None:
+        try:
+            mt = int(max_tokens)
+            if mt > 0:
+                out["max_tokens"] = mt
+        except (TypeError, ValueError):
+            pass
+    stop = pick("stop")
+    if stop:
+        out["stop"] = stop
+    return out
 
 
-async def stream_kie_response(
-    url: str,
-    request_data: dict,
-    model: str
-):
-    """Stream responses from KIE.AI API"""
-    
+# --------------------------------------------------------------------------- #
+# Обращение к KIE.AI                                                          #
+# --------------------------------------------------------------------------- #
+
+
+async def _post_upstream(path: str, payload: Dict[str, Any]) -> httpx.Response:
+    client = get_client()
     try:
-        client = await get_http_client()
-        request_data["stream"] = True
-        
-        async with client.stream("POST", url, json=request_data) as response:
-            if response.status_code != 200:
-                error_msg = f"KIE.AI API error: {response.status_code}"
-                await log_error("API_ERROR", error_msg, {"url": url})
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
-
-            async for line in response.aiter_lines():
-                if not line:
-                    continue
-                # Strip SSE "data: " prefix (OpenAI-compatible APIs use SSE format)
-                if line.startswith("data: "):
-                    line = line[6:]
-                if line == "[DONE]":
-                    break
-                try:
-                    kie_chunk = json.loads(line)
-                    ollama_chunk = await transform_kie_to_ollama(kie_chunk, is_streaming=True)
-                    yield f"{json.dumps(ollama_chunk)}\n"
-                except json.JSONDecodeError:
-                    continue
-
-            # Always send the final done message so clients don't hang
-            done_chunk = {
-                "model": model,
-                "created_at": datetime.now().isoformat(),
-                "message": {"role": "assistant", "content": ""},
-                "done": True,
-                "done_reason": "stop"
-            }
-            yield f"{json.dumps(done_chunk)}\n"
-    
-    except httpx.RequestError as e:
-        await log_error("REQUEST_ERROR", str(e), {"url": url})
-        raise HTTPException(status_code=503, detail="Backend service unavailable")
+        return await client.post(path, json=payload)
+    except httpx.TimeoutException as exc:
+        err_log.error("Upstream timeout on %s: %s", path, exc)
+        raise HTTPException(status_code=504, detail="Upstream timeout") from exc
+    except httpx.ConnectError as exc:
+        err_log.error("Upstream connect error on %s: %s", path, exc)
+        raise HTTPException(status_code=503, detail="Upstream unavailable") from exc
+    except httpx.HTTPError as exc:
+        err_log.error("Upstream HTTP error on %s: %s", path, exc)
+        raise HTTPException(status_code=502, detail=f"Upstream error: {exc}") from exc
 
 
-# ============================================================================
-# Lifecycle Events
-# ============================================================================
-
-@app.on_event("startup")
-async def startup_event():
-    """Initialize on startup"""
-    global http_client
-    
-    if not settings.kie_ai_api_key:
-        raise ValueError("KIE_AI_API_KEY environment variable is not set")
-    
-    general_logger.info(
-        f"Ollama-compatible proxy starting"
-    )
-    general_logger.info(f"Backend: {settings.kie_ai_api_url}")
+def _raise_for_upstream(resp: httpx.Response) -> None:
+    if resp.is_success:
+        return
+    detail: Any
+    try:
+        detail = resp.json()
+    except Exception:
+        detail = resp.text[:1000]
+    err_log.error("Upstream %s: %s", resp.status_code, detail)
+    if 400 <= resp.status_code < 500:
+        raise HTTPException(status_code=resp.status_code, detail=detail)
+    raise HTTPException(status_code=502, detail={"upstream_status": resp.status_code, "body": detail})
 
 
-@app.on_event("shutdown")
-async def shutdown_event():
-    """Cleanup on shutdown"""
-    global http_client
-    
-    if http_client:
-        await http_client.aclose()
-    
-    general_logger.info("Ollama-compatible proxy shutting down")
+async def _kie_chat_completion(
+    model: str,
+    messages: List[Dict[str, Any]],
+    stream: bool,
+    extra: Dict[str, Any],
+) -> Tuple[Optional[Dict[str, Any]], Optional[AsyncIterator[bytes]], Optional[httpx.Response]]:
+    """Возвращает либо (json, None, None) для не-стриминга,
+    либо (None, async-iterator, response) для стриминга."""
+    payload: Dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "stream": stream,
+    }
+    payload.update(extra)
+
+    client = get_client()
+    if not stream:
+        resp = await _post_upstream("/chat/completions", payload)
+        _raise_for_upstream(resp)
+        try:
+            return resp.json(), None, None
+        except json.JSONDecodeError as exc:
+            err_log.error("Invalid JSON from upstream: %s", exc)
+            raise HTTPException(status_code=502, detail="Invalid JSON from upstream") from exc
+
+    # Streaming -- открываем долгоживущий поток
+    req = client.build_request("POST", "/chat/completions", json=payload)
+    try:
+        resp = await client.send(req, stream=True)
+    except httpx.TimeoutException as exc:
+        err_log.error("Upstream stream timeout: %s", exc)
+        raise HTTPException(status_code=504, detail="Upstream timeout") from exc
+    except httpx.ConnectError as exc:
+        err_log.error("Upstream stream connect error: %s", exc)
+        raise HTTPException(status_code=503, detail="Upstream unavailable") from exc
+    except httpx.HTTPError as exc:
+        err_log.error("Upstream stream HTTP error: %s", exc)
+        raise HTTPException(status_code=502, detail=f"Upstream error: {exc}") from exc
+
+    if not resp.is_success:
+        # Прочитаем ошибочное тело, чтобы вернуть осмысленный код
+        body = await resp.aread()
+        await resp.aclose()
+        detail: Any
+        try:
+            detail = json.loads(body.decode("utf-8", errors="replace"))
+        except Exception:
+            detail = body.decode("utf-8", errors="replace")[:1000]
+        err_log.error("Upstream stream %s: %s", resp.status_code, detail)
+        if 400 <= resp.status_code < 500:
+            raise HTTPException(status_code=resp.status_code, detail=detail)
+        raise HTTPException(status_code=502, detail={"upstream_status": resp.status_code, "body": detail})
+
+    return None, resp.aiter_lines(), resp
 
 
-# ============================================================================
-# API Endpoints - System Information
-# ============================================================================
+# --------------------------------------------------------------------------- #
+# Парсинг SSE и трансформация в Ollama                                        #
+# --------------------------------------------------------------------------- #
 
-@app.get("/", include_in_schema=False)
-async def root():
-    """Root endpoint"""
-    return {"status": "Ollama is running"}
+
+def _parse_sse_line(line: str) -> Optional[Dict[str, Any]]:
+    """Один SSE-чанк OpenAI: `data: {...}` или `data: [DONE]`. None -> завершение."""
+    if not line:
+        return {}
+    if not line.startswith("data:"):
+        return {}
+    payload = line[5:].strip()
+    if payload == "[DONE]":
+        return None
+    try:
+        return json.loads(payload)
+    except json.JSONDecodeError:
+        return {}
+
+
+def _openai_chunk_to_ollama(chunk: Dict[str, Any], model: str) -> Dict[str, Any]:
+    choice = (chunk.get("choices") or [{}])[0]
+    delta = choice.get("delta") or {}
+    content = delta.get("content") or ""
+    role = delta.get("role") or "assistant"
+    return {
+        "model": model,
+        "created_at": _iso_now(),
+        "message": {"role": role, "content": content},
+        "done": False,
+    }
+
+
+def _openai_chunk_to_ollama_generate(chunk: Dict[str, Any], model: str) -> Dict[str, Any]:
+    choice = (chunk.get("choices") or [{}])[0]
+    delta = choice.get("delta") or {}
+    content = delta.get("content") or ""
+    return {
+        "model": model,
+        "created_at": _iso_now(),
+        "response": content,
+        "done": False,
+    }
+
+
+def _final_ollama_chat(model: str, total_ns: int, eval_count: int = 0) -> Dict[str, Any]:
+    return {
+        "model": model,
+        "created_at": _iso_now(),
+        "message": {"role": "assistant", "content": ""},
+        "done": True,
+        "done_reason": "stop",
+        "total_duration": total_ns,
+        "load_duration": 0,
+        "prompt_eval_count": 0,
+        "prompt_eval_duration": 0,
+        "eval_count": eval_count,
+        "eval_duration": total_ns,
+    }
+
+
+def _final_ollama_generate(model: str, total_ns: int, eval_count: int = 0) -> Dict[str, Any]:
+    base = _final_ollama_chat(model, total_ns, eval_count)
+    base.pop("message", None)
+    base["response"] = ""
+    return base
+
+
+def _openai_full_to_ollama_chat(resp: Dict[str, Any], model: str, total_ns: int) -> Dict[str, Any]:
+    choice = (resp.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    usage = resp.get("usage") or {}
+    return {
+        "model": model,
+        "created_at": _iso_now(),
+        "message": {
+            "role": message.get("role") or "assistant",
+            "content": message.get("content") or "",
+        },
+        "done": True,
+        "done_reason": choice.get("finish_reason") or "stop",
+        "total_duration": total_ns,
+        "load_duration": 0,
+        "prompt_eval_count": int(usage.get("prompt_tokens") or 0),
+        "prompt_eval_duration": 0,
+        "eval_count": int(usage.get("completion_tokens") or 0),
+        "eval_duration": total_ns,
+    }
+
+
+def _openai_full_to_ollama_generate(resp: Dict[str, Any], model: str, total_ns: int) -> Dict[str, Any]:
+    choice = (resp.get("choices") or [{}])[0]
+    message = choice.get("message") or {}
+    usage = resp.get("usage") or {}
+    return {
+        "model": model,
+        "created_at": _iso_now(),
+        "response": message.get("content") or "",
+        "done": True,
+        "done_reason": choice.get("finish_reason") or "stop",
+        "total_duration": total_ns,
+        "load_duration": 0,
+        "prompt_eval_count": int(usage.get("prompt_tokens") or 0),
+        "prompt_eval_duration": 0,
+        "eval_count": int(usage.get("completion_tokens") or 0),
+        "eval_duration": total_ns,
+    }
+
+
+# --------------------------------------------------------------------------- #
+# Стриминг-генераторы                                                         #
+# --------------------------------------------------------------------------- #
+
+
+async def _ollama_chat_stream(model: str, lines: AsyncIterator[bytes], upstream: httpx.Response, mode: str) -> AsyncIterator[bytes]:
+    """mode = "chat" | "generate" -- какой формат финального чанка отдавать."""
+    start = time.perf_counter_ns()
+    eval_count = 0
+    chunk_count = 0
+    try:
+        async for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            line = line.strip()
+            if not line:
+                continue
+            if settings.dev_mode:
+                preview = line if len(line) < 200 else line[:200] + "..."
+                log.debug("SSE< %s", preview)
+            parsed = _parse_sse_line(line)
+            if parsed is None:
+                break
+            if not parsed:
+                continue
+            if mode == "chat":
+                out = _openai_chunk_to_ollama(parsed, model)
+            else:
+                out = _openai_chunk_to_ollama_generate(parsed, model)
+            content_present = (out.get("message", {}).get("content") if mode == "chat" else out.get("response"))
+            if content_present:
+                eval_count += 1
+            chunk_count += 1
+            yield (json.dumps(out, ensure_ascii=False) + "\n").encode("utf-8")
+        total_ns = time.perf_counter_ns() - start
+        final = (
+            _final_ollama_chat(model, total_ns, eval_count)
+            if mode == "chat"
+            else _final_ollama_generate(model, total_ns, eval_count)
+        )
+        yield (json.dumps(final, ensure_ascii=False) + "\n").encode("utf-8")
+        if settings.dev_mode:
+            log.debug("SSE stream done: model=%s chunks=%d eval=%d", model, chunk_count, eval_count)
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:
+        err_log.exception("Stream forwarding failed: %s", exc)
+        err_payload = {
+            "model": model,
+            "created_at": _iso_now(),
+            "done": True,
+            "error": str(exc),
+        }
+        yield (json.dumps(err_payload, ensure_ascii=False) + "\n").encode("utf-8")
+    finally:
+        await upstream.aclose()
+
+
+async def _openai_chat_stream(lines: AsyncIterator[bytes], upstream: httpx.Response) -> AsyncIterator[bytes]:
+    """Пропускаем SSE OpenAI как есть, добавляя финальный [DONE], если апстрим его не прислал."""
+    saw_done = False
+    try:
+        async for line in lines:
+            if isinstance(line, bytes):
+                line = line.decode("utf-8", errors="replace")
+            stripped = line.strip()
+            if not stripped:
+                yield b"\n"
+                continue
+            if settings.dev_mode:
+                preview = stripped if len(stripped) < 200 else stripped[:200] + "..."
+                log.debug("SSE< %s", preview)
+            if stripped.startswith("data:") and stripped[5:].strip() == "[DONE]":
+                saw_done = True
+            yield (stripped + "\n\n").encode("utf-8")
+        if not saw_done:
+            yield b"data: [DONE]\n\n"
+    except (asyncio.CancelledError, GeneratorExit):
+        raise
+    except Exception as exc:
+        err_log.exception("OpenAI stream forwarding failed: %s", exc)
+        payload = json.dumps({"error": {"message": str(exc), "type": "proxy_error"}})
+        yield f"data: {payload}\n\n".encode("utf-8")
+        yield b"data: [DONE]\n\n"
+    finally:
+        await upstream.aclose()
+
+
+# --------------------------------------------------------------------------- #
+# Ollama-совместимые эндпоинты                                                #
+# --------------------------------------------------------------------------- #
+
+
+@app.get("/")
+async def root() -> Dict[str, Any]:
+    return {
+        "service": "copilot-ollama-kie-proxy",
+        "ollama_compat_version": settings.ollama_compat_version,
+        "upstream": settings.kie_ai_api_url,
+        "default_model": settings.default_model,
+    }
+
+
+@app.get("/health")
+@app.get("/api/health")
+async def health() -> Dict[str, str]:
+    return {"status": "ok"}
 
 
 @app.get("/api/version")
-async def api_version():
-    """Get API version (Ollama compatible)"""
-    # Return an Ollama-compatible version string. Allow override via env var.
+async def api_version() -> Dict[str, str]:
     return {"version": settings.ollama_compat_version}
 
 
 @app.get("/api/tags")
-async def list_models():
-    """List available models (Ollama compatible)"""
-    
-    await log_request("GET", "/api/tags", {})
-    
-    try:
-        return {
-            "models": [
-                {
-                    "name": "claude-opus-4-6:latest",
-                    "model": "claude-opus-4-6:latest",
-                    "modified_at": datetime.now().isoformat(),
-                    "size": 0,
-                    "digest": "sha256:claude-opus-4-6",
-                    "details": {
-                        "parent_model": "",
-                        "format": "api",
-                        "family": "claude",
-                        "families": ["claude"],
-                        "parameter_size": "unknown",
-                        "quantization_level": "none"
-                    }
-                }
-            ]
-        }
-    except Exception as e:
-        await log_error("TAGS_ERROR", str(e), {})
-        raise HTTPException(status_code=500, detail="Failed to list models")
+async def api_tags() -> Dict[str, Any]:
+    return {"models": [_ollama_model_descriptor(m) for m in settings.available_models]}
 
 
-# ============================================================================
-# API Endpoints - Model Management
-# ============================================================================
+@app.get("/api/ps")
+async def api_ps() -> Dict[str, Any]:
+    """Список «запущенных» моделей -- возвращаем все доступные (заглушка)."""
+    return {"models": [_ollama_model_descriptor(m) for m in settings.available_models]}
 
-@app.post("/api/pull")
-async def pull_model(request: PullRequest, background_tasks: BackgroundTasks):
-    """Pull model (stub - no actual download needed)"""
-    
-    await log_request("POST", "/api/pull", {"model": request.name})
-    
+
+def _model_capabilities(name: str) -> List[str]:
+    """Capabilities, как их возвращает реальная Ollama в /api/show.
+    Без `tools` VSCode Copilot Chat не считает модель пригодной.
+    Объявлять `thinking`/`vision` опасно: Copilot ищет обработчик по
+    capability в lookup-таблице, и для отсутствующих ключей падает с
+    "Cannot read properties of undefined (reading 'bind')"."""
+    return ["completion", "tools"]
+
+
+def _show_payload(name: str) -> Dict[str, Any]:
     return {
-        "status": "success",
-        "digest": f"sha256:{request.name}",
-        "total": 0
+        "license": "Proprietary -- via KIE.AI",
+        "modelfile": (
+            f"# Modelfile for {name}\n"
+            f"FROM {name}\n"
+            "TEMPLATE \"\"\"{{ if .System }}{{ .System }}\n\n{{ end }}"
+            "{{ range .Messages }}{{ .Role }}: {{ .Content }}\n{{ end }}\"\"\"\n"
+        ),
+        "parameters": "stop \"<|im_end|>\"\nstop \"</s>\"\n",
+        "template": "{{ .Prompt }}",
+        "details": _model_details(name),
+        "model_info": {
+            "general.architecture": "llama",
+            "general.basename": name,
+            "llama.context_length": settings.model_context_length,
+            "llama.embedding_length": 0,
+        },
+        "context_length": settings.model_context_length,
+        "capabilities": _model_capabilities(name),
+        "modified_at": _iso_now(),
     }
-
-
-@app.delete("/api/delete")
-async def delete_model(request: DeleteRequest, background_tasks: BackgroundTasks):
-    """Delete model (stub implementation)"""
-    
-    await log_request("DELETE", "/api/delete", {"model": request.name})
-    
-    return {"status": "success"}
 
 
 @app.post("/api/show")
-async def show_model(request: Request):
-    """Show model details (Ollama compatible)"""
-    
-    raw_body = b""
+async def api_show(request: Request) -> Dict[str, Any]:
+    name: Optional[str] = None
+    ctype = request.headers.get("content-type", "")
+    body_bytes = await request.body()
+    if body_bytes:
+        if "application/json" in ctype:
+            try:
+                data = json.loads(body_bytes.decode("utf-8"))
+                if isinstance(data, dict):
+                    name = data.get("name") or data.get("model")
+            except json.JSONDecodeError:
+                pass
+        elif "application/x-www-form-urlencoded" in ctype or "multipart/form-data" in ctype:
+            form = await request.form()
+            name = form.get("name") or form.get("model")  # type: ignore[assignment]
+    if not name:
+        name = request.query_params.get("name") or request.query_params.get("model")
+    name = _model_or_default(name)
+    return _show_payload(name)
+
+
+async def _handle_ollama_chat(body: Dict[str, Any]) -> Response:
+    model = _model_or_default(body.get("model"))
+    upstream_model = _strip_tag(model)
+    messages = body.get("messages") or []
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="`messages` must be a list")
+    stream = bool(body.get("stream", True))
+    sampling = _extract_sampling(body)
+
+    log.info(
+        "CHAT model=%s msgs=%d stream=%s sampling=%s",
+        model,
+        len(messages),
+        stream,
+        sampling,
+    )
+
+    if not stream:
+        start = time.perf_counter_ns()
+        full, _, _ = await _kie_chat_completion(upstream_model, messages, False, sampling)
+        assert full is not None
+        return JSONResponse(_openai_full_to_ollama_chat(full, model, time.perf_counter_ns() - start))
+
+    _, lines, upstream = await _kie_chat_completion(upstream_model, messages, True, sampling)
+    assert lines is not None and upstream is not None
+    return StreamingResponse(
+        _ollama_chat_stream(model, lines, upstream, mode="chat"),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.post("/api/chat")
+@app.post("/api/chat/completions")
+async def api_chat(request: Request) -> Response:
+    body = await _json_body(request)
+    return await _handle_ollama_chat(body)
+
+
+@app.post("/api/generate")
+async def api_generate(request: Request) -> Response:
+    body = await _json_body(request)
+    model = _model_or_default(body.get("model"))
+    upstream_model = _strip_tag(model)
+    prompt = body.get("prompt")
+    system = body.get("system")
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="`prompt` is required")
+    messages = _build_messages(prompt=prompt, messages=None, system=system)
+    stream = bool(body.get("stream", True))
+    sampling = _extract_sampling(body)
+
+    log.info("GENERATE model=%s stream=%s sampling=%s", model, stream, sampling)
+
+    if not stream:
+        start = time.perf_counter_ns()
+        full, _, _ = await _kie_chat_completion(upstream_model, messages, False, sampling)
+        assert full is not None
+        return JSONResponse(_openai_full_to_ollama_generate(full, model, time.perf_counter_ns() - start))
+
+    _, lines, upstream = await _kie_chat_completion(upstream_model, messages, True, sampling)
+    assert lines is not None and upstream is not None
+    return StreamingResponse(
+        _ollama_chat_stream(model, lines, upstream, mode="generate"),
+        media_type="application/x-ndjson",
+    )
+
+
+@app.post("/api/embeddings")
+@app.post("/api/embed")
+async def api_embeddings(request: Request) -> Dict[str, Any]:
+    body = await _json_body(request)
+    model = _model_or_default(body.get("model"))
+    upstream_model = _strip_tag(model)
+    text = body.get("prompt") or body.get("input")
+    if text is None:
+        raise HTTPException(status_code=400, detail="`prompt` or `input` is required")
+
+    payload: Dict[str, Any] = {"model": upstream_model, "input": text}
+    log.info("EMBEDDINGS model=%s", model)
+    resp = await _post_upstream("/embeddings", payload)
+    _raise_for_upstream(resp)
     try:
-        raw_body = await request.body()
-        model_name = None
-        content_type = request.headers.get("content-type", "")
-        
-        if raw_body:
-            if "application/json" in content_type:
-                body = await request.json()
-                if isinstance(body, dict):
-                    model_name = body.get("name") or body.get("model")
-            elif "application/x-www-form-urlencoded" in content_type or "multipart/form-data" in content_type:
-                form = await request.form()
-                model_name = form.get("name") or form.get("model")
-        
-        if not model_name:
-            model_name = request.query_params.get("name") or request.query_params.get("model")
-        
-        if not model_name:
-            raise HTTPException(
-                status_code=400,
-                detail="Model name is required in JSON body, form body, or query parameters"
-            )
-        
-        await log_request("POST", "/api/show", {"model": model_name})
-        
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="Invalid JSON from upstream") from exc
+
+    items = data.get("data") or []
+    if not items:
+        raise HTTPException(status_code=502, detail="Upstream returned no embeddings")
+    first = items[0].get("embedding") if isinstance(items[0], dict) else None
+    if isinstance(text, list):
         return {
-            "modelfile": f"FROM {model_name}",
-            "parameters": "",
-            "template": "{{ .Prompt }}",
-            "details": {
-                "parent_model": "",
-                "format": "api",
-                "family": "claude",
-                "families": ["claude"],
-                "parameter_size": "unknown",
-                "quantization_level": "none"
-            },
-            "model_info": {
-                "general.architecture": "claude",
-                "llm.context_length": 200000
-            },
-            "capabilities": ["completion", "tools"]
+            "model": model,
+            "embeddings": [item.get("embedding") for item in items if isinstance(item, dict)],
         }
-    except HTTPException:
-        raise
-    except Exception as e:
-        await log_error(
-            "SHOW_ERROR",
-            str(e),
-            {
-                "content_type": content_type,
-                "body": raw_body.decode("utf-8", errors="replace")
-            }
-        )
-        raise HTTPException(status_code=500, detail="Failed to show model")
+    return {"model": model, "embedding": first or []}
+
+
+@app.post("/api/pull")
+async def api_pull(request: Request) -> Response:
+    body = await _json_body(request, allow_empty=True)
+    name = body.get("name") or body.get("model") or settings.default_model
+    stream = bool(body.get("stream", True))
+    log.info("PULL (stub) model=%s stream=%s", name, stream)
+
+    if not stream:
+        return JSONResponse({"status": "success"})
+
+    async def gen() -> AsyncIterator[bytes]:
+        for status in ("pulling manifest", "verifying sha256 digest", "writing manifest", "success"):
+            yield (json.dumps({"status": status}) + "\n").encode("utf-8")
+
+    return StreamingResponse(gen(), media_type="application/x-ndjson")
+
+
+@app.post("/api/create")
+async def api_create() -> Dict[str, str]:
+    return {"status": "success"}
+
+
+@app.post("/api/copy")
+async def api_copy() -> Dict[str, str]:
+    return {"status": "success"}
+
+
+@app.delete("/api/delete")
+async def api_delete() -> Dict[str, str]:
+    return {"status": "success"}
 
 
 @app.head("/api/blobs/{digest}")
-async def check_blob(digest: str):
-    """Check blob existence"""
-    return {}
+async def api_blob_head(digest: str) -> Response:
+    return Response(status_code=200)
 
 
-# ============================================================================
-# API Endpoints - Chat/Completions
-# ============================================================================
-
-@app.post("/api/chat", response_model=None)
-async def chat(request: ChatRequest, background_tasks: BackgroundTasks):
-    """Chat endpoint - main Ollama chat API"""
-    
-    await log_request("POST", "/api/chat", {
-        "model": request.model,
-        "stream": request.stream,
-        "messages_count": len(request.messages)
-    })
-    
-    try:
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        
-        kie_request = await transform_ollama_to_kie(
-            model=request.model,
-            messages=messages,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k
-        )
-        
-        url = f"{settings.kie_ai_api_url}/chat/completions"
-        
-        if request.stream:
-            return StreamingResponse(
-                stream_kie_response(url, kie_request, request.model),
-                media_type="application/x-ndjson"
-            )
-        else:
-            client = await get_http_client()
-            response = await client.post(url, json=kie_request)
-            
-            if response.status_code != 200:
-                error_msg = f"KIE.AI API error: {response.status_code}"
-                background_tasks.add_task(log_error, "CHAT_ERROR", error_msg, {})
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
-            
-            kie_response = response.json()
-            ollama_response = await transform_kie_to_ollama(kie_response)
-            return ollama_response
-    
-    except Exception as e:
-        background_tasks.add_task(log_error, "CHAT_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Chat failed")
+@app.post("/api/blobs/{digest}")
+async def api_blob_post(digest: str) -> Response:
+    return Response(status_code=201)
 
 
-@app.post("/api/chat/completions", response_model=None)
-async def chat_completions(request: ChatRequest, background_tasks: BackgroundTasks):
-    """Chat completions endpoint (OpenAI compatible)"""
-    
-    await log_request("POST", "/api/chat/completions", {
-        "model": request.model,
-        "stream": request.stream,
-        "messages_count": len(request.messages)
-    })
-    
-    try:
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        
-        kie_request = await transform_ollama_to_kie(
-            model=request.model,
-            messages=messages,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k
-        )
-        
-        url = f"{settings.kie_ai_api_url}/chat/completions"
-        
-        if request.stream:
-            return StreamingResponse(
-                stream_kie_response(url, kie_request, request.model),
-                media_type="application/x-ndjson"
-            )
-        else:
-            client = await get_http_client()
-            response = await client.post(url, json=kie_request)
-            
-            if response.status_code != 200:
-                error_msg = f"KIE.AI API error: {response.status_code}"
-                background_tasks.add_task(log_error, "CHAT_ERROR", error_msg, {})
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
-            
-            kie_response = response.json()
-            ollama_response = await transform_kie_to_ollama(kie_response)
-            return ollama_response
-    
-    except Exception as e:
-        background_tasks.add_task(log_error, "CHAT_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Chat failed")
+# --------------------------------------------------------------------------- #
+# OpenAI-совместимые эндпоинты                                                #
+# --------------------------------------------------------------------------- #
 
 
-# ============================================================================
-# API Endpoints - Generate (Legacy)
-# ============================================================================
-
-@app.post("/api/generate", response_model=None)
-async def generate(request: GenerateRequest, background_tasks: BackgroundTasks):
-    """Generate text completion (Ollama compatible)"""
-    
-    await log_request("POST", "/api/generate", {
-        "model": request.model,
-        "stream": request.stream
-    })
-    
-    try:
-        kie_request = await transform_ollama_to_kie(
-            model=request.model,
-            prompt=request.prompt,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k
-        )
-        
-        url = f"{settings.kie_ai_api_url}/completions"
-        
-        if request.stream:
-            return StreamingResponse(
-                stream_kie_response(url, kie_request, request.model),
-                media_type="application/x-ndjson"
-            )
-        else:
-            client = await get_http_client()
-            response = await client.post(url, json=kie_request)
-            
-            if response.status_code != 200:
-                error_msg = f"KIE.AI API error: {response.status_code}"
-                background_tasks.add_task(log_error, "GENERATE_ERROR", error_msg, {})
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
-            
-            kie_response = response.json()
-            ollama_response = await transform_kie_to_ollama(kie_response)
-            return ollama_response
-    
-    except Exception as e:
-        background_tasks.add_task(log_error, "GENERATE_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Generation failed")
-
-
-# ============================================================================
-# API Endpoints - Embeddings
-# ============================================================================
-
-@app.post("/api/embeddings", response_model=None)
-async def embeddings(request: EmbeddingsRequest, background_tasks: BackgroundTasks):
-    """Generate embeddings"""
-    
-    await log_request("POST", "/api/embeddings", {
-        "model": request.model
-    })
-    
-    try:
-        # For now, return dummy embeddings
-        # In production, call KIE.AI embeddings API if available
-        return {
-            "embedding": [0.1] * 1536,
-            "model": request.model
-        }
-    except Exception as e:
-        background_tasks.add_task(log_error, "EMBEDDINGS_ERROR", str(e), {})
-        raise HTTPException(status_code=500, detail="Embeddings generation failed")
-
-
-# ============================================================================
-# API Endpoints - Health/Status
-# ============================================================================
-
-@app.get("/health", include_in_schema=False)
-@app.get("/api/health")
-async def health_check():
-    """Health check endpoint"""
+@app.get("/v1/models")
+async def v1_models() -> Dict[str, Any]:
     return {
-        "status": "ok",
-        "timestamp": datetime.now().isoformat()
+        "object": "list",
+        "data": [_openai_model_descriptor(m) for m in settings.available_models],
     }
 
 
-# ============================================================================
-# OpenAI Compatible Endpoints (/v1/* prefix)
-# ============================================================================
+@app.get("/v1/models/{model}")
+async def v1_model(model: str) -> Dict[str, Any]:
+    return _openai_model_descriptor(model)
 
-@app.get("/v1/models", include_in_schema=False)
-async def openai_list_models():
-    """List available models (OpenAI compatible endpoint)"""
-    
-    await log_request("GET", "/v1/models", {})
-    
-    try:
-        return {
-            "object": "list",
-            "data": [
-                {
-                    "id": "claude-opus-4-6",
-                    "object": "model",
-                    "owned_by": "kie-ai",
-                    "created": int(datetime.now().timestamp()),
-                    "permission": []
+
+@app.post("/v1/chat/completions")
+async def v1_chat_completions(request: Request) -> Response:
+    body = await _json_body(request)
+    model = _model_or_default(body.get("model"))
+    upstream_model = _strip_tag(model)
+    messages = body.get("messages") or []
+    if not isinstance(messages, list):
+        raise HTTPException(status_code=400, detail="`messages` must be a list")
+    stream = bool(body.get("stream", False))
+
+    # Передаём все параметры, кроме служебных
+    extra = {
+        k: v
+        for k, v in body.items()
+        if k not in ("model", "messages", "stream") and v is not None
+    }
+
+    log.info("V1 CHAT model=%s msgs=%d stream=%s", model, len(messages), stream)
+
+    if not stream:
+        full, _, _ = await _kie_chat_completion(upstream_model, messages, False, extra)
+        assert full is not None
+        # Подменяем модель в ответе на запрошенную (с тегом, если был)
+        full["model"] = model
+        return JSONResponse(full)
+
+    _, lines, upstream = await _kie_chat_completion(upstream_model, messages, True, extra)
+    assert lines is not None and upstream is not None
+    return StreamingResponse(
+        _openai_chat_stream(lines, upstream),
+        media_type="text/event-stream",
+    )
+
+
+@app.post("/v1/completions")
+async def v1_completions(request: Request) -> Response:
+    body = await _json_body(request)
+    model = _model_or_default(body.get("model"))
+    upstream_model = _strip_tag(model)
+    prompt = body.get("prompt")
+    if prompt is None:
+        raise HTTPException(status_code=400, detail="`prompt` is required")
+    if isinstance(prompt, list):
+        prompt = "\n".join(str(p) for p in prompt)
+    stream = bool(body.get("stream", False))
+    extra = {
+        k: v
+        for k, v in body.items()
+        if k not in ("model", "prompt", "stream", "suffix", "echo", "logprobs", "best_of")
+        and v is not None
+    }
+    messages = [{"role": "user", "content": str(prompt)}]
+    log.info("V1 COMPLETIONS model=%s stream=%s", model, stream)
+
+    if not stream:
+        full, _, _ = await _kie_chat_completion(upstream_model, messages, False, extra)
+        assert full is not None
+        choice = (full.get("choices") or [{}])[0]
+        text = (choice.get("message") or {}).get("content") or ""
+        return JSONResponse(
+            {
+                "id": "cmpl-" + uuid.uuid4().hex[:24],
+                "object": "text_completion",
+                "created": int(time.time()),
+                "model": model,
+                "choices": [
+                    {
+                        "text": text,
+                        "index": 0,
+                        "logprobs": None,
+                        "finish_reason": choice.get("finish_reason") or "stop",
+                    }
+                ],
+                "usage": full.get("usage") or {},
+            }
+        )
+
+    _, lines, upstream = await _kie_chat_completion(upstream_model, messages, True, extra)
+    assert lines is not None and upstream is not None
+
+    async def gen() -> AsyncIterator[bytes]:
+        completion_id = "cmpl-" + uuid.uuid4().hex[:24]
+        created = int(time.time())
+        try:
+            async for line in lines:
+                if isinstance(line, bytes):
+                    line = line.decode("utf-8", errors="replace")
+                line = line.strip()
+                if not line:
+                    continue
+                parsed = _parse_sse_line(line)
+                if parsed is None:
+                    break
+                if not parsed:
+                    continue
+                choice = (parsed.get("choices") or [{}])[0]
+                delta = choice.get("delta") or {}
+                content = delta.get("content") or ""
+                out = {
+                    "id": completion_id,
+                    "object": "text_completion",
+                    "created": created,
+                    "model": model,
+                    "choices": [
+                        {
+                            "text": content,
+                            "index": 0,
+                            "logprobs": None,
+                            "finish_reason": choice.get("finish_reason"),
+                        }
+                    ],
                 }
-            ]
-        }
-    except Exception as e:
-        await log_error("V1_MODELS_ERROR", str(e), {})
-        raise HTTPException(status_code=500, detail="Failed to list models")
+                yield f"data: {json.dumps(out, ensure_ascii=False)}\n\n".encode("utf-8")
+            yield b"data: [DONE]\n\n"
+        finally:
+            await upstream.aclose()
+
+    return StreamingResponse(gen(), media_type="text/event-stream")
 
 
-@app.get("/v1/models/{model}", include_in_schema=False)
-async def openai_get_model(model: str):
-    """Get model information (OpenAI compatible endpoint)"""
-    
-    await log_request("GET", f"/v1/models/{model}", {})
-    
+@app.post("/v1/embeddings")
+async def v1_embeddings(request: Request) -> Dict[str, Any]:
+    body = await _json_body(request)
+    model = _model_or_default(body.get("model"))
+    upstream_model = _strip_tag(model)
+    payload = dict(body)
+    payload["model"] = upstream_model
+    log.info("V1 EMBEDDINGS model=%s", model)
+    resp = await _post_upstream("/embeddings", payload)
+    _raise_for_upstream(resp)
     try:
-        return {
-            "id": model,
-            "object": "model",
-            "owned_by": "kie-ai",
-            "created": int(datetime.now().timestamp()),
-            "permission": []
-        }
-    except Exception as e:
-        await log_error("V1_MODEL_ERROR", str(e), {"model": model})
-        raise HTTPException(status_code=500, detail="Failed to get model info")
+        data = resp.json()
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=502, detail="Invalid JSON from upstream") from exc
+    data["model"] = model
+    return data
 
 
-@app.post("/v1/chat/completions", include_in_schema=False)
-async def openai_chat_completions(request: ChatRequest, background_tasks: BackgroundTasks):
-    """Chat completions endpoint (OpenAI compatible /v1/ prefix)"""
-    
-    await log_request("POST", "/v1/chat/completions", {
-        "model": request.model,
-        "stream": request.stream,
-        "messages_count": len(request.messages)
-    })
-    
+# --------------------------------------------------------------------------- #
+# Вспомогательное                                                             #
+# --------------------------------------------------------------------------- #
+
+
+async def _json_body(request: Request, allow_empty: bool = False) -> Dict[str, Any]:
+    raw = await request.body()
+    if not raw:
+        if allow_empty:
+            return {}
+        raise HTTPException(status_code=400, detail="Empty request body")
     try:
-        messages = [{"role": msg.role, "content": msg.content} for msg in request.messages]
-        
-        kie_request = await transform_ollama_to_kie(
-            model=request.model,
-            messages=messages,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k
-        )
-        
-        url = f"{settings.kie_ai_api_url}/chat/completions"
-        
-        if request.stream:
-            return StreamingResponse(
-                stream_kie_response(url, kie_request, request.model),
-                media_type="application/x-ndjson"
-            )
-        else:
-            client = await get_http_client()
-            response = await client.post(url, json=kie_request)
-            
-            if response.status_code != 200:
-                error_msg = f"KIE.AI API error: {response.status_code}"
-                background_tasks.add_task(log_error, "V1_CHAT_ERROR", error_msg, {})
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
-            
-            kie_response = response.json()
-            ollama_response = await transform_kie_to_ollama(kie_response)
-            return ollama_response
-    
-    except Exception as e:
-        background_tasks.add_task(log_error, "V1_CHAT_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Chat failed")
+        data = json.loads(raw.decode("utf-8"))
+    except json.JSONDecodeError as exc:
+        raise HTTPException(status_code=400, detail=f"Invalid JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise HTTPException(status_code=400, detail="JSON body must be an object")
+    return data
 
 
-@app.post("/v1/completions", include_in_schema=False)
-async def openai_completions(request: GenerateRequest, background_tasks: BackgroundTasks):
-    """Completions endpoint (OpenAI compatible /v1/ prefix)"""
-    
-    await log_request("POST", "/v1/completions", {
-        "model": request.model,
-        "stream": request.stream
-    })
-    
+# Catch-all -- ловим всё, что не подошло к маршрутам выше, чтобы видеть в логах,
+# какие эндпоинты ещё дёргают клиенты (VSCode/Copilot и т.п.). Регистрируется
+# ПОСЛЕ всех специализированных маршрутов, поэтому в их работу не вмешивается.
+@app.api_route(
+    "/{full_path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    include_in_schema=False,
+)
+async def catch_all(full_path: str, request: Request) -> JSONResponse:
+    body_preview = ""
     try:
-        kie_request = await transform_ollama_to_kie(
-            model=request.model,
-            prompt=request.prompt,
-            temperature=request.temperature,
-            top_p=request.top_p,
-            top_k=request.top_k
-        )
-        
-        url = f"{settings.kie_ai_api_url}/chat/completions"
-        
-        if request.stream:
-            return StreamingResponse(
-                stream_kie_response(url, kie_request, request.model),
-                media_type="application/x-ndjson"
-            )
-        else:
-            client = await get_http_client()
-            response = await client.post(url, json=kie_request)
-            
-            if response.status_code != 200:
-                error_msg = f"KIE.AI API error: {response.status_code}"
-                background_tasks.add_task(log_error, "V1_COMPLETIONS_ERROR", error_msg, {})
-                raise HTTPException(status_code=response.status_code, detail=error_msg)
-            
-            kie_response = response.json()
-            ollama_response = await transform_kie_to_ollama(kie_response)
-            return ollama_response
-    
-    except Exception as e:
-        background_tasks.add_task(log_error, "V1_COMPLETIONS_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Completions failed")
+        raw = await request.body()
+        if raw:
+            txt = raw.decode("utf-8", errors="replace")
+            body_preview = txt if len(txt) <= 512 else txt[:512] + "...<truncated>"
+    except Exception:
+        body_preview = "<unreadable>"
+    log.warning(
+        "UNHANDLED %s /%s query=%s body=%s",
+        request.method,
+        full_path,
+        dict(request.query_params),
+        body_preview,
+    )
+    if request.method == "OPTIONS":
+        return JSONResponse(status_code=204, content=None)
+    return JSONResponse(status_code=404, content={"error": f"Not found: {request.method} /{full_path}"})
 
-
-@app.post("/v1/embeddings", include_in_schema=False)
-async def openai_embeddings(request: EmbeddingsRequest, background_tasks: BackgroundTasks):
-    """Embeddings endpoint (OpenAI compatible /v1/ prefix)"""
-    
-    await log_request("POST", "/v1/embeddings", {"model": request.model})
-    
-    try:
-        # Normalize input to list
-        if isinstance(request.input, str):
-            inputs = [request.input]
-        else:
-            inputs = request.input
-        
-        client = await get_http_client()
-        url = f"{settings.kie_ai_api_url}/embeddings"
-        
-        kie_request = {
-            "model": request.model,
-            "input": inputs
-        }
-        
-        response = await client.post(url, json=kie_request)
-        
-        if response.status_code != 200:
-            error_msg = f"KIE.AI API error: {response.status_code}"
-            background_tasks.add_task(log_error, "V1_EMBEDDINGS_ERROR", error_msg, {})
-            raise HTTPException(status_code=response.status_code, detail=error_msg)
-        
-        return response.json()
-    
-    except Exception as e:
-        background_tasks.add_task(log_error, "V1_EMBEDDINGS_EXCEPTION", str(e), {})
-        raise HTTPException(status_code=500, detail="Embeddings generation failed")
-
-
-# ============================================================================
-# Error Handlers
-# ============================================================================
 
 @app.exception_handler(HTTPException)
-async def http_exception_handler(request: Request, exc: HTTPException):
-    """Custom HTTP exception handler"""
+async def http_exception_handler(request: Request, exc: HTTPException) -> JSONResponse:
     return JSONResponse(
         status_code=exc.status_code,
-        content={"error": exc.detail}
+        content={"error": exc.detail if not isinstance(exc.detail, str) else exc.detail},
     )
 
 
 @app.exception_handler(Exception)
-async def general_exception_handler(request: Request, exc: Exception):
-    """General exception handler"""
-    error_msg = str(exc)
-    await log_error("UNHANDLED_EXCEPTION", error_msg, {})
-    return JSONResponse(
-        status_code=500,
-        content={"error": "Internal server error"}
-    )
+async def unhandled_exception_handler(request: Request, exc: Exception) -> JSONResponse:
+    err_log.exception("Unhandled error on %s %s", request.method, request.url.path)
+    return JSONResponse(status_code=500, content={"error": str(exc)})
 
-
-# ============================================================================
-# Main
-# ============================================================================
 
 if __name__ == "__main__":
     import uvicorn
-    
+
     uvicorn.run(
         "main:app",
         host=settings.proxy_host,
         port=settings.proxy_port,
-        reload=False,
-        log_config=None  # Use our custom logger
+        log_level=settings.log_level.lower(),
     )

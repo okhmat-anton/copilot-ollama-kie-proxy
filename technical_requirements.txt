@@ -1,148 +1,290 @@
 ================================================================================
-TECHNICAL REQUIREMENTS: Ollama-KIE.AI Proxy Service
+ТЕХНИЧЕСКИЕ ТРЕБОВАНИЯ
+Проект: copilot-ollama-kie-proxy
 ================================================================================
 
-PROJECT OVERVIEW
+ЦЕЛЬ
+----
+Создать асинхронное проксирующее приложение на Python, которое:
+- Принимает запросы от VSCode (и любых Ollama-совместимых клиентов)
+- Перенаправляет их на KIE.AI API (https://api.kie.ai/v1)
+- Полностью эмулирует Ollama API, чтобы VSCode воспринимал сервис как локальный Ollama
+- Дополнительно поддерживает OpenAI-совместимый API (/v1/) для работы с OpenAI SDK
+
+Документация KIE.AI:
+  https://kie.ai/claude-opus-4-6
+  https://docs.kie.ai/market/claude/claude-opus-4-6
+
+
 ================================================================================
-A lightweight Python proxy service that emulates the Ollama API to transparently
-proxy requests to the KIE.AI API backend. This enables seamless integration of
-KIE.AIs language model capabilities with existing Ollama-compatible clients,
-including support for Claude Opus 4.6 models.
-
-PURPOSE
--------
-- Provide API compatibility layer between Ollama clients and KIE.AI backend
-- Enable transparent model switching without client-side changes
-- Support Claude Opus 4.6 and other advanced language models
-- Maintain performance with minimal latency overhead
-- Enable local development and testing environments
-
-SYSTEM ARCHITECTURE
+АРХИТЕКТУРА
 ================================================================================
-The proxy service will operate as a standalone Python application that:
 
-1. Listens for incoming HTTP requests on a configurable port (default: 11434)
-2. Accepts Ollama-compatible API requests (pull, generate, chat/completions)
-3. Transforms requests into KIE.AI API format
-4. Forwards requests to the KIE.AI backend API
-5. Transforms responses back into Ollama API format
-6. Returns responses to the client
+Стек:
+  - Python 3.9+
+  - Виртуальное окружение venv (обязательно, изоляция зависимостей)
+  - FastAPI + uvicorn (асинхронный веб-сервер)
+  - httpx (асинхронный HTTP-клиент для проксирования)
+  - python-dotenv (конфигурация через .env)
 
-CORE FUNCTIONALITY
+Виртуальное окружение:
+  - Каталог venv/ в корне проекта (добавить в .gitignore)
+  - Создаётся командой: python3 -m venv venv
+  - Активация: source venv/bin/activate
+  - Все make-команды (install, start, stop, ...) работают через venv/bin/python
+    и venv/bin/pip -- без необходимости ручной активации.
+
+Структура файлов:
+  main.py            -- FastAPI-приложение, все эндпоинты и логика проксирования
+  config.py          -- Settings-класс, читает переменные из .env
+  logger.py          -- Настройка логирования (файлы, ротация)
+  requirements.txt   -- Зависимости Python
+  .env               -- Конфигурация (не коммитить в git)
+  .env.example       -- Пример конфигурации (коммитить в git)
+  Makefile           -- Команды управления сервисом
+  start.sh           -- Скрипт запуска через uvicorn
+
+
 ================================================================================
-The proxy must implement the following endpoints:
-
-1. Model Management
-   - GET /api/tags - List available models
-   - POST /api/pull - Pull/download model (stub implementation)
-   - DELETE /api/delete - Delete model (stub implementation)
-   - HEAD /api/blobs/{digest} - Check blob existence
-
-2. Model Inference
-   - POST /api/generate - Generate text completion (streaming)
-   - POST /api/chat/completions - Chat endpoint with messages
-
-3. System Information
-   - GET /api/version - Return service version
-   - GET /health - Health check endpoint
-
-API SPECIFICATIONS
+КОНФИГУРАЦИЯ (.env / .env.example)
 ================================================================================
-Request Format (Ollama Compatible):
-- Content-Type: application/json
-- Support both streaming and non-streaming modes
-- Accept streaming requests with "stream": true parameter
-- Return Server-Sent Events (SSE) format for streaming responses
 
-Response Format:
-- JSON responses matching Ollama API specification
-- Streaming responses in line-delimited JSON format
-- Include proper HTTP status codes and error messages
-- Support response metadata (model name, tokens, timing)
+# KIE.AI API
+KIE_AI_API_KEY=your_kie_ai_api_key_here
+KIE_AI_API_URL=https://api.kie.ai/v1
 
-KIE.AI API Integration:
-- Map Ollama model names to KIE.AI model identifiers
-- Transform Ollama message format to KIE.AI request schema
-- Extract relevant fields from KIE.AI responses
-- Handle KIE.AI authentication and API keys
+# Параметры прокси-сервера
+PROXY_HOST=127.0.0.1
+PROXY_PORT=11777            # Базовый порт прокси (отдельный, чтобы не конфликтовать с локальным Ollama на 11434)
 
-IMPLEMENTATION REQUIREMENTS
+# Логирование
+LOG_LEVEL=INFO              # DEBUG | INFO | WARNING | ERROR
+LOG_DIR=./logs
+REQUEST_LOGGING_ENABLED=true
+REQUEST_LOG_HEADERS=true    # Логировать заголовки входящих запросов
+REQUEST_LOG_BODY=true       # Логировать тело запроса
+REQUEST_LOG_BODY_LIMIT=4096 # Максимум символов тела в логе (обрезать длинные)
+
+# Модели
+DEFAULT_MODEL=claude-opus-4-6
+OLLAMA_COMPAT_VERSION=0.8.0 # Версия, которую вернёт /api/version
+
+
 ================================================================================
-Framework & Libraries:
-- Python 3.9+
-- Flask or FastAPI for HTTP server
-- Requests library for backend communication
-- Python-dotenv for configuration management
-- Pydantic for request/response validation
-- Support for streaming responses with generators
-
-Configuration:
-- Environment variables for KIE.AI API key
-- Configurable proxy listen port
-- Configurable backend URL
-- Model mapping configuration (Ollama model name → KIE.AI model ID)
-- Logging configuration (level, format)
-
-Request Handling:
-- Request validation and schema verification
-- Proper error handling and status code mapping
-- Request timeout management
-- Connection pooling for backend requests
-- Comprehensive logging of all requests/responses
-
-Response Handling:
-- Stream response processing for large outputs
-- Proper HTTP headers (Content-Type, Transfer-Encoding)
-- Token counting and metadata enrichment
-- Error message transformation
-- Response compression support (optional)
-
-SECURITY REQUIREMENTS
+MAKE-КОМАНДЫ
 ================================================================================
-- KIE.AI API key management via environment variables (never hardcoded)
-- Request rate limiting (configurable)
-- Input validation and sanitization
-- HTTPS support for production deployment
-- CORS handling if serving web clients
-- Request size limits to prevent abuse
 
-SUPPORTED MODELS
-================================================================================
-- Claude Opus 4.6 (primary)
-- Additional KIE.AI models as available
-- Model alias mapping (e.g., "ollama-neural" → KIE.AI model ID)
+make venv       -- создать виртуальное окружение в ./venv (если отсутствует)
+make install    -- make venv + установить зависимости в venv (venv/bin/pip install -r requirements.txt)
+make env-setup  -- скопировать .env.example -> .env если .env отсутствует
+make start      -- запустить сервис через venv/bin/uvicorn (фоновый режим)
+make stop       -- остановить фоновый процесс сервиса
+make restart    -- stop + start
+make status     -- показать, запущен ли сервис и на каком PID
+make logs       -- хвост логов в реальном времени (tail -f logs/*)
+make test       -- запустить встроенные тесты (curl-команды)
+make clean      -- удалить логи и временные файлы (venv не удаляется)
+make clean-venv -- удалить виртуальное окружение ./venv
 
-TESTING REQUIREMENTS
-================================================================================
-- Unit tests for request/response transformation logic
-- Integration tests against mock KIE.AI API
-- Streaming response handling tests
-- Error condition and edge case tests
-- Load testing for performance validation
-- Compatibility testing with Ollama clients
 
-DEPLOYMENT
 ================================================================================
-- Docker containerization support
-- Environment-based configuration
-- Graceful shutdown handling
-- Health check endpoints for orchestration
-- Logging and monitoring integration points
+API ЭНДПОИНТЫ -- OLLAMA-СОВМЕСТИМЫЕ (/api/)
+================================================================================
 
-DOCUMENTATION
-================================================================================
-- README with installation and usage instructions
-- API endpoint documentation
-- Configuration guide
-- Example requests/responses
-- Docker deployment instructions
-- Troubleshooting guide
+GET  /api/version
+  Возвращает версию Ollama (из OLLAMA_COMPAT_VERSION).
+  Ответ: {"version": "0.8.0"}
 
-FUTURE ENHANCEMENTS
+GET  /api/tags
+  Список доступных моделей. VSCode использует этот эндпоинт для обнаружения моделей.
+  Ответ: {"models": [{"name": "claude-opus-4-6", "model": "claude-opus-4-6", ...}]}
+  Каждая модель содержит поля: name, model, modified_at, size, digest, details.
+
+POST /api/show
+  Детали конкретной модели.
+  Принимает name из JSON-тела, form-data или query-параметра.
+  Ответ: {"modelfile": "...", "parameters": "...", "template": "...", "details": {...}}
+
+POST /api/chat
+  Чат с историей сообщений.
+  Тело: {model, messages: [{role, content}], stream, temperature, top_p, top_k}
+  stream=true  -- SSE-поток (каждая строка -- JSON-объект в формате Ollama)
+  stream=false -- единый JSON-ответ
+
+POST /api/generate
+  Генерация текста по промпту (без истории).
+  Тело: {model, prompt, stream, temperature, top_p, top_k}
+  Поддерживает streaming аналогично /api/chat.
+
+POST /api/chat/completions
+  Алиас /api/chat для совместимости с некоторыми клиентами.
+
+POST /api/pull
+  Заглушка -- имитирует "скачивание" модели (200 OK, сообщение об успехе).
+
+DELETE /api/delete
+  Заглушка -- имитирует удаление модели.
+
+HEAD /api/blobs/{digest}
+  Заглушка -- отвечает 200 OK.
+
+POST /api/embeddings
+  Эмбеддинги текста. Проксирует на KIE.AI /embeddings.
+  Ответ в формате Ollama: {"embedding": [...]}
+
+GET  /api/health
+  Healthcheck. Ответ: {"status": "ok"}
+
+GET  /health
+  Алиас /api/health.
+
+GET  /
+  Корневой маршрут. Возвращает минимальную информацию о сервисе.
+
+
 ================================================================================
-- Multiple backend support (fallback routing)
-- Response caching layer
-- Advanced model parameter mapping
-- Batch request processing
-- Metrics and monitoring integration
-- WebSocket support for persistent connections
+API ЭНДПОИНТЫ -- OPENAI-СОВМЕСТИМЫЕ (/v1/)
+================================================================================
+
+Необходимы для работы с OpenAI Python SDK и VSCode-расширениями,
+которые используют OpenAI-протокол.
+
+GET  /v1/models
+  Список моделей в формате OpenAI.
+  Ответ: {"object": "list", "data": [{"id": "claude-opus-4-6", "object": "model", ...}]}
+
+GET  /v1/models/{model}
+  Детали конкретной модели в формате OpenAI.
+
+POST /v1/chat/completions
+  Чат в формате OpenAI. Трансформирует запрос для KIE.AI, ответ -- обратно.
+  Поддерживает streaming (SSE).
+
+POST /v1/completions
+  Генерация текста в формате OpenAI. Оборачивает промпт в messages для KIE.AI.
+
+POST /v1/embeddings
+  Эмбеддинги в формате OpenAI. Проксирует напрямую.
+
+
+================================================================================
+ТРАНСФОРМАЦИЯ ЗАПРОСОВ
+================================================================================
+
+Входящий Ollama/OpenAI запрос -> KIE.AI формат:
+  {
+    "model": "<model>",
+    "messages": [{"role": "...", "content": "..."}],
+    "temperature": <float>,
+    "top_p": <float>,
+    "stream": <bool>
+  }
+
+KIE.AI ответ (не-streaming) -> Ollama-формат:
+  {
+    "model": "<model>",
+    "created_at": "<ISO8601>",
+    "message": {"role": "assistant", "content": "<text>"},
+    "done": true,
+    "total_duration": <ns>,
+    "eval_count": <tokens>
+  }
+
+KIE.AI streaming ответ (SSE: data: {...}) -> каждый чанк в Ollama-формате:
+  {"model": "...", "created_at": "...", "message": {"role": "assistant", "content": "<chunk>"}, "done": false}
+  Финальная строка: {..., "done": true}
+
+
+================================================================================
+ЛОГИРОВАНИЕ
+================================================================================
+
+Три категории лог-файлов в LOG_DIR:
+  general_YYYY-MM.log  -- общие события (старт/стоп, инициализация)
+  error_YYYY-MM.log    -- ошибки и исключения
+  request_YYYY-MM.log  -- все входящие запросы (если REQUEST_LOGGING_ENABLED=true)
+
+Ротация: ежемесячная (новый файл каждый месяц).
+
+Middleware логирует все входящие запросы:
+  - method, path, query_params, client IP
+  - заголовки (если REQUEST_LOG_HEADERS=true)
+  - тело запроса до REQUEST_LOG_BODY_LIMIT символов (если REQUEST_LOG_BODY=true)
+
+Каждое проксирование логирует:
+  - тип операции (CHAT, GENERATE, EMBEDDINGS, ...)
+  - модель, количество сообщений, streaming или нет
+
+Ошибки логируют:
+  - тип ошибки, сообщение, контекст запроса
+
+
+================================================================================
+ОБРАБОТКА ОШИБОК
+================================================================================
+
+- HTTP 4xx от KIE.AI -- прокинуть клиенту с тем же кодом
+- HTTP 5xx от KIE.AI -- вернуть 502 Bad Gateway с деталями
+- Сетевые ошибки (таймаут, connection refused) -- 503 Service Unavailable
+- Невалидный JSON в ответе KIE.AI -- 502 с описанием
+- Все необработанные исключения -- 500 + запись в error.log
+- Формат ошибки: {"error": "<описание>"}
+
+
+================================================================================
+ПРОИЗВОДИТЕЛЬНОСТЬ
+================================================================================
+
+- Единый httpx.AsyncClient с connection pool (создаётся при startup, закрывается при shutdown)
+- Таймаут на запросы к KIE.AI: 120 секунд (LLM-ответы длинные)
+- Streaming через async generator: не буферировать весь ответ в памяти
+
+
+================================================================================
+СОВМЕСТИМОСТЬ С VSCODE
+================================================================================
+
+Требования для корректной работы VSCode с Ollama-расширениями:
+
+1. Порт 11777 -- базовый порт прокси. В клиенте VSCode/Continue указать явно
+   (http://127.0.0.1:11777), так как этот порт не сканируется автоматически.
+2. GET /api/tags возвращает список моделей с полем "details" (family, format, ...)
+3. GET /api/version возвращает версию >= 0.8.0
+4. POST /api/chat поддерживает streaming в Ollama SSE-формате
+5. POST /api/show возвращает modelfile с шаблоном промпта
+
+Пример настройки VSCode (settings.json для Continue):
+  "models": [{"title": "claude-opus-4-6", "provider": "ollama", "model": "claude-opus-4-6"}]
+
+
+================================================================================
+ЗАВИСИМОСТИ (requirements.txt)
+================================================================================
+
+fastapi>=0.104.1
+uvicorn>=0.24.0
+httpx>=0.25.2
+python-dotenv>=1.0.0
+aiofiles>=23.2.1
+
+
+================================================================================
+ТЕСТИРОВАНИЕ (make test)
+================================================================================
+
+Минимальный набор curl-проверок:
+  curl http://127.0.0.1:11434/api/version
+  curl http://127.0.0.1:11434/api/tags
+  curl http://127.0.0.1:11434/health
+  curl http://127.0.0.1:11434/v1/models
+  curl -X POST http://127.0.0.1:11434/api/chat \
+       -H "Content-Type: application/json" \
+       -d '{"model":"claude-opus-4-6","messages":[{"role":"user","content":"ping"}],"stream":false}'
+
+Python-тест с OpenAI SDK:
+  from openai import OpenAI
+  client = OpenAI(base_url="http://127.0.0.1:11434/v1/", api_key="ollama")
+  response = client.chat.completions.create(
+      model="claude-opus-4-6",
+      messages=[{"role": "user", "content": "ping"}]
+  )

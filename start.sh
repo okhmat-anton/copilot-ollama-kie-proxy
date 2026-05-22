@@ -1,38 +1,25 @@
-#!/bin/bash
-# Start script for Ollama-KIE.AI Proxy
-# This script can be used directly or as part of systemd service
+#!/usr/bin/env bash
+# Запуск прокси через uvicorn внутри venv.
+# Используется make-таргетами start/restart, но можно вызывать и вручную.
+set -euo pipefail
 
-set -e
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+cd "$ROOT_DIR"
 
-# Get the directory where this script is located
-SCRIPT_DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
-cd "$SCRIPT_DIR"
-
-# Load environment
-if [ -f .env ]; then
-    export $(cat .env | grep -v '#' | xargs)
-fi
-
-# Check if required environment variable is set
-if [ -z "$KIE_AI_API_KEY" ]; then
-    echo "❌ Error: KIE_AI_API_KEY is not set"
-    echo "Please configure .env file or set the environment variable"
+if [[ ! -x "venv/bin/uvicorn" ]]; then
+    echo "venv/bin/uvicorn not found. Run 'make install' first." >&2
     exit 1
 fi
 
-# Create logs directory
-mkdir -p logs
+# Подхватываем PROXY_HOST / PROXY_PORT из .env (если есть)
+if [[ -f .env ]]; then
+    set -a
+    # shellcheck disable=SC1091
+    source .env
+    set +a
+fi
 
-# Get host and port from config
-HOST=${PROXY_HOST:-127.0.0.1}
-PORT=${PROXY_PORT:-11434}
+HOST="${PROXY_HOST:-127.0.0.1}"
+PORT="${PROXY_PORT:-11777}"
 
-echo "🚀 Starting Ollama-KIE.AI Proxy"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "Host: $HOST"
-echo "Port: $PORT"
-echo "Log Directory: ./logs"
-echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-
-# Start the service
-python -m uvicorn main:app --host "$HOST" --port "$PORT" --workers 4
+exec venv/bin/uvicorn main:app --host "$HOST" --port "$PORT" --log-level "${LOG_LEVEL:-info}"
