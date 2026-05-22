@@ -42,7 +42,7 @@ class Settings:
         default_factory=lambda: os.getenv("KIE_AI_API_KEY", "")
     )
     kie_ai_api_url: str = field(
-        default_factory=lambda: os.getenv("KIE_AI_API_URL", "https://api.kie.ai/v1").rstrip("/")
+        default_factory=lambda: os.getenv("KIE_AI_API_URL", "https://api.kie.ai/claude/v1").rstrip("/")
     )
 
     # Proxy
@@ -78,8 +78,18 @@ class Settings:
     ollama_compat_version: str = field(
         default_factory=lambda: os.getenv("OLLAMA_COMPAT_VERSION", "0.8.0")
     )
+    # Префикс, добавляемый к именам моделей в /api/tags и /v1/models,
+    # чтобы в VSCode/Copilot было видно, что это KIE-проксированная модель.
+    # Снимается перед отправкой запроса в KIE.AI.
+    model_name_prefix: str = field(
+        default_factory=lambda: os.getenv("MODEL_NAME_PREFIX", "kie/")
+    )
     model_context_length: int = field(
         default_factory=lambda: _env_int("MODEL_CONTEXT_LENGTH", 1_000_000)
+    )
+    # Anthropic требует max_tokens в каждом запросе -- дефолт для клиентов, что его не шлют.
+    default_max_tokens: int = field(
+        default_factory=lambda: _env_int("DEFAULT_MAX_TOKENS", 8192)
     )
 
     # HTTP client
